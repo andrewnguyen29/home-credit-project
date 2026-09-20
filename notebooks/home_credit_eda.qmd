@@ -1,6 +1,6 @@
 ---
 title: "Home Credit Default Risk Exploratory Data Analysis"
-subtitle: "From business framing to defensible data preparation"
+subtitle: "Understanding the application data before modeling"
 date: last-modified
 format:
   html:
@@ -27,47 +27,49 @@ editor: source
 
 ## Executive summary
 
-This exploratory analysis finds a useful but challenging application-level modeling table. The training data contain 307,511 unique applications and 121 candidate predictors; only 8.07% of applicants experienced the payment difficulties identified by `TARGET`. External risk scores and age show the clearest individual associations with the outcome, but no single variable is sufficient for an approval decision. The data also contain substantial, patterned missingness, an 18% sentinel code in employment duration, rare invalid labels, extreme monetary observations, and a material difference in loan-type mix between the training and scoring cohorts.
+For this project, I explored the application data to understand what it contains and what needs to be fixed before modeling. The training file has 307,511 applications and 121 possible predictor columns. Only 8.07% of the applicants had the payment difficulties identified by `TARGET`. The external scores and applicant age have the clearest individual relationships with the target, but neither one would be enough to make an approval decision by itself.
 
-These findings change the modeling plan. Preprocessing must be learned on training folds only, missingness indicators should be tested rather than treating all missing values as noise, raw time variables should be converted to interpretable units, and evaluation should emphasize ROC AUC alongside precision-recall and threshold-based business tradeoffs. Group-level rates in this notebook are descriptive associations—not causal effects or instructions to approve or deny a person.
+The dataset also has several problems that will affect preparation and modeling. Many fields are missing, 18% of the employment-duration values use an impossible code, a few category labels are invalid, and some monetary values are unusually large. The mix of loan types is also different between the training and test data.
+
+Based on these results, missing values and unusual codes will need to be handled carefully. Any preparation steps must be learned from the training folds so that information from validation data does not leak into the model. The model should be evaluated with ROC AUC, precision-recall results, calibration, and approval-threshold comparisons. The group differences shown in this notebook are relationships in the data. They do not prove that any characteristic causes payment difficulties, and they should not be used alone to approve or decline an applicant.
 
 ## Business problem and EDA questions
 
-Home Credit serves applicants who may have limited or nontraditional credit histories. At application time, the business must balance two costly errors: approving a loan that later encounters payment difficulties, and declining an applicant who would have repaid. The proposed analytic product is therefore a risk-ranking model that supports underwriters; it should not replace policy, affordability checks, or human review.
+Home Credit provides loans to customers that traditional banks may turn away, including customers with little or no credit history. This creates two risks for the company. Home Credit could approve an applicant who later has payment difficulties, or it could decline an applicant who would have repaid. The purpose of this project is to use the available historical data to help underwriters estimate the risk of each application. The model would support the approval process, but it would not replace company policy, affordability checks, or underwriter review.
 
-The supplied data define `TARGET = 1` as a client who had sufficiently late payment on at least one of the first installments, with the precise lateness and installment thresholds anonymized in the data dictionary. Model discrimination can be compared using ROC AUC, but deployment success should ultimately be judged at a decision threshold: default or difficulty rate at a given approval volume, approval volume at a risk limit, calibration, and performance across relevant groups.
+In the supplied data, `TARGET = 1` means the customer had a late payment that met the dataset's definition of payment difficulty during the first installments. The exact number of late days and installments is not provided. ROC AUC can show how well a model ranks higher-risk and lower-risk applicants, but it does not decide which applications should be approved. A useful final evaluation will also need to compare approval volume, payment-difficulty rates, calibration, and results for important applicant groups.
 
-EDA bridges that framing to data preparation by answering five questions:
+I used the business problem, the assignment requirements, and the structure of the data to develop five EDA questions:
 
 1. What is the observation grain, and can the training and test files be combined or joined safely?
 2. How imbalanced is the target, and what does that imply for evaluation?
 3. Which values are missing, invalid, sentinel-coded, or unusually extreme?
 4. Which applicant and loan characteristics have the strongest descriptive relationship with payment difficulty?
-5. Are the training and scoring cohorts similar enough for a model trained on one to generalize to the other?
+5. Are the training and test applications similar enough for a model trained on one to work well on the other?
 
 ## Setup and data loading
 
-Only `application_train.csv` and `application_test.csv` are analyzed, as required for this stage. The supplementary relational tables are deliberately left out so that the application-level grain remains explicit.
+For this stage of the project, I only used `application_train.csv` and `application_test.csv`. The assignment does not require the supplementary tables yet, so I left them out and kept the analysis at the application level.
 
 ```{r}
-# Load only the packages needed for manipulation, plots, and compact tables.
+# Load the packages used for data work, plots, and tables.
 library(data.table)
 library(ggplot2)
 library(scales)
 library(knitr)
 
-# Make paths work whether Quarto executes from the project root or notebook folder.
+# Set file paths so the notebook works from the project or notebook folder.
 project_root <- if (file.exists("data/raw/application_train.csv")) "." else ".."
 train_path <- file.path(project_root, "data", "raw", "application_train.csv")
 test_path  <- file.path(project_root, "data", "raw", "application_test.csv")
 dictionary_path <- file.path(project_root, "docs", "HomeCredit_columns_description.csv")
 
-# Treat blank fields as missing and suppress the progress bar in the rendered report.
+# Read blank fields as missing values and hide the loading progress bar.
 train <- fread(train_path, na.strings = c("", "NA"), showProgress = FALSE)
 test  <- fread(test_path,  na.strings = c("", "NA"), showProgress = FALSE)
 dictionary <- fread(dictionary_path, encoding = "Latin-1", showProgress = FALSE)
 
-# Use a restrained, consistent visual style throughout the notebook.
+# Use the same plot style and colors throughout the notebook.
 theme_set(
   theme_minimal(base_size = 12) +
     theme(
@@ -84,19 +86,19 @@ teal <- "#168AAD"
 coral <- "#D95D39"
 gold <- "#D9A441"
 
-# Reusable helpers keep formatting decisions out of the analytical code below.
+# Create short functions for formatting percentages and counts.
 pct <- function(x, accuracy = 0.1) percent(x, accuracy = accuracy)
 fmt_n <- function(x) comma(x, accuracy = 1)
 ```
 
-The files are read without changing the raw source. All derived variables exist only in memory, which keeps the audit trail reproducible.
+The code reads the raw files without changing them. Any new variables are created in memory so the same analysis can be run again from the original data.
 
 ## Structure, grain, and keys
 
 ```{r}
-# Summarize table shape, key uniqueness, and target availability.
+# Check the number of rows and columns, unique IDs, and target availability.
 structure_summary <- data.table(
-  Dataset = c("Training applications", "Scoring applications"),
+  Dataset = c("Training applications", "Test applications"),
   Rows = c(nrow(train), nrow(test)),
   Columns = c(ncol(train), ncol(test)),
   `Unique SK_ID_CURR` = c(uniqueN(train$SK_ID_CURR), uniqueN(test$SK_ID_CURR)),
@@ -105,13 +107,13 @@ structure_summary <- data.table(
 )
 
 kable(structure_summary, format.args = list(big.mark = ","), align = "lrrrrc",
-      caption = "Application table structure and key audit")
+      caption = "Application table structure and ID checks")
 ```
 
-Both files have exactly one row per `SK_ID_CURR`; there are no duplicate keys and no identifier overlap across files. The training file has one extra column because `TARGET` is withheld from the scoring set. Thus, these tables should be **row-bound only for consistent preprocessing or population comparisons**, never joined to one another. If supplementary tables are later added, their many-to-one or many-to-many histories must first be aggregated to `SK_ID_CURR`; a direct join would duplicate application rows and distort both rates and model weights.
+Both files have one row for each `SK_ID_CURR`. There are no duplicate IDs and no IDs shared by the two files. The training file has one extra column because it includes `TARGET`, while the test file does not. These two files should not be joined to each other. They can be stacked temporarily when the same preparation or comparison needs to be applied to both. If the supplementary tables are added later, they will need to be summarized to one row per `SK_ID_CURR` before joining. Otherwise, one application could be repeated several times and change the results.
 
 ```{r}
-# Count storage types to understand the mix of continuous, count, flag, and label fields.
+# Count the imported data types in the training file.
 type_counts <- data.table(
   Storage_type = names(table(vapply(train, function(x) class(x)[1], character(1)))),
   Columns = as.integer(table(vapply(train, function(x) class(x)[1], character(1))))
@@ -119,12 +121,12 @@ type_counts <- data.table(
 kable(type_counts, caption = "Training columns by imported storage type")
 ```
 
-Storage type is not semantic type. Many imported integers are binary flags or ordered ratings, while some numeric fields are normalized scores. This matters because blindly scaling all numeric columns or treating all integers as continuous would discard useful meaning.
+The imported storage type does not always describe how a column should be used. Many integer columns are yes-or-no flags or ratings, while some numeric columns are normalized scores. For modeling, I will need to use the meaning of each column instead of treating every integer as a continuous number.
 
-## Target balance and evaluation implications
+## Target distribution and evaluation
 
 ```{r}
-# Calculate class counts and label them in business language.
+# Count both target groups and create readable labels.
 target_summary <- train[, .(Applications = .N), by = TARGET]
 target_summary[, Share := Applications / sum(Applications)]
 target_summary[, Outcome := fifelse(TARGET == 1,
@@ -137,20 +139,20 @@ ggplot(target_summary, aes(x = Outcome, y = Applications, fill = factor(TARGET))
   scale_fill_manual(values = c(navy, coral)) +
   scale_y_continuous(labels = label_comma(), expand = expansion(mult = c(0, 0.14))) +
   labs(
-    title = "Payment difficulties occur in 8.07% of training applications",
-    subtitle = "A majority-class prediction would be 91.93% accurate but operationally useless",
+    title = "Payment difficulties appear in 8.07% of training applications",
+    subtitle = "Predicting the majority group every time would be 91.93% accurate but would not identify risk",
     x = NULL, y = "Number of applications"
   )
 ```
 
-The 11.4-to-1 class imbalance makes accuracy a misleading headline metric. ROC AUC matches the project's ranking goal, but precision-recall AUC is also needed because it focuses attention on the minority class. Final model selection should add calibration and threshold tables showing approvals, flagged applicants, and observed difficulty rates. Stratified cross-validation is appropriate; resampling or class weights, if used, must occur within training folds.
+There are about 11.4 applicants without payment difficulties for every applicant with payment difficulties. Because of this imbalance, a model could have high accuracy by predicting the majority class almost every time. ROC AUC will help measure how well the model ranks applicants, and precision-recall results will show how well it identifies the smaller difficult-payment group. I will also need calibration and threshold tables that show how many applicants would be approved or flagged at different score cutoffs. Cross-validation should keep a similar target percentage in each fold, and any resampling or class weights must be applied inside the training folds.
 
 ## Missing values
 
 ### Extent and concentration
 
 ```{r}
-# Compute missingness for every field, then display the most incomplete features.
+# Calculate the missing rate for every column and show the 20 highest rates.
 missing_profile <- data.table(
   Feature = names(train),
   Missing = vapply(train, function(x) sum(is.na(x)), integer(1)),
@@ -165,7 +167,7 @@ ggplot(top_missing, aes(x = reorder(Feature, Missing_rate), y = Missing_rate)) +
   coord_flip(clip = "off") +
   scale_y_continuous(labels = label_percent(), limits = c(0, 0.78)) +
   labs(
-    title = "Missingness is concentrated in housing and asset fields",
+    title = "Most highly missing fields describe housing and assets",
     subtitle = paste0(sum(missing_profile$Missing_rate > 0.50),
                       " features are more than 50% missing; ",
                       sum(missing_profile$Missing_rate == 0), " are complete"),
@@ -173,14 +175,14 @@ ggplot(top_missing, aes(x = reorder(Feature, Missing_rate), y = Missing_rate)) +
   )
 ```
 
-The highest-missing fields are repeated measurements of common area, non-living apartments, living apartments, minimum floors, building age, and other housing characteristics. Their shared patterns suggest that missingness often reflects whether a property record or applicable asset exists, not random data loss. For example, `OWN_CAR_AGE` is absent for most non-car owners. Automatic column deletion at a single threshold would erase this structure.
+Most of the highly missing fields describe housing, including common areas, apartment space, floors, and building age. These fields are missing in similar patterns, which could mean the information did not apply or was not available for that applicant. For example, `OWN_CAR_AGE` is normally missing when the applicant does not own a car. Removing every column above one missing-value cutoff could remove information about why the value is missing.
 
-The three external scores differ sharply in coverage: `EXT_SOURCE_1` is 56.38% missing, `EXT_SOURCE_3` is 19.83% missing, and `EXT_SOURCE_2` is only 0.21% missing. Since the scores later show strong outcome separation, imputation and missingness indicators should be validated carefully.
+The three external scores also have very different coverage. `EXT_SOURCE_1` is 56.38% missing, `EXT_SOURCE_3` is 19.83% missing, and `EXT_SOURCE_2` is only 0.21% missing. Because these scores have a strong relationship with the target later in the analysis, I will need to compare different ways of handling their missing values.
 
-### Missingness may itself be informative
+### Missing values and the target
 
 ```{r}
-# Compare missing rates by target and rank features by the absolute gap.
+# Compare missing rates for the two target groups and rank the largest differences.
 missing_by_target <- rbindlist(lapply(names(train), function(v) {
   data.table(
     Feature = v,
@@ -206,18 +208,18 @@ ggplot(missing_gap_long,
   scale_color_manual(values = c(navy, coral)) +
   scale_y_continuous(labels = label_percent()) +
   labs(
-    title = "Property-data absence is more common among difficult-payment cases",
-    subtitle = "Twelve features with the largest target-group missingness gaps",
+    title = "Property information is missing more often for difficult-payment cases",
+    subtitle = "The 12 columns with the largest differences between target groups",
     x = NULL, y = "Share missing", color = "Observed outcome"
   )
 ```
 
-For several property fields, the missing rate is roughly seven percentage points higher among applicants with payment difficulties. This does not prove that missing property data causes difficulty: missingness can proxy for housing type, wealth, geography, or the data collection process. It does justify testing explicit missing-value indicators and comparing them with models that handle missingness natively. All imputation values and missing-indicator decisions must be learned inside cross-validation to prevent leakage.
+For several property fields, the missing rate is about seven percentage points higher for applicants with payment difficulties. This does not mean that missing property information causes payment problems. The pattern could be connected to housing type, income, location, or the way the information was collected. I will test missing-value flags and compare them with models that can handle missing values directly. Any values used for imputation must be calculated inside cross-validation so that the validation data does not influence training.
 
-## Validity, sentinel codes, and unusual values
+## Invalid codes and unusual values
 
 ```{r}
-# Quantify data-quality conditions that require an explicit preparation decision.
+# Count selected data problems that need a preparation rule.
 quality_issues <- data.table(
   Check = c(
     "DAYS_EMPLOYED equals 365,243",
@@ -242,15 +244,15 @@ quality_issues <- data.table(
 )
 quality_issues[, Share := Rows / nrow(train)]
 kable(quality_issues, digits = 4, format.args = list(big.mark = ","),
-      caption = "Selected validity and outlier checks")
+      caption = "Selected invalid-code and unusual-value checks")
 ```
 
-`DAYS_BIRTH`, `DAYS_REGISTRATION`, and `DAYS_ID_PUBLISH` are non-positive as documented, but `DAYS_EMPLOYED = 365243` is about 1,000 years and cannot be a real tenure. It affects 55,374 rows (18.01%) and should be recoded to missing with a separate sentinel indicator before converting valid negative values to positive years. This is safer than allowing a model to interpret the code as an enormous continuous value.
+The values in `DAYS_BIRTH`, `DAYS_REGISTRATION`, and `DAYS_ID_PUBLISH` follow the data dictionary and are recorded as zero or negative days before the application. `DAYS_EMPLOYED = 365243`, however, is equal to about 1,000 years and cannot be a real employment length. This code appears in 55,374 rows, or 18.01% of the training data. I will replace it with a missing value, create a flag showing where the code appeared, and then convert the valid employment values into years.
 
-The four `XNA` gender labels and two `Unknown` family-status labels should be retained as explicit unknown categories or recoded consistently—not guessed. Extreme incomes and old cars are suspicious but not automatically errors; robust transforms, winsorization determined on training folds, and sensitivity checks are preferable to deleting applicants. There are no nonpositive income or credit amounts, no applicants with more children than family members, and valid negative employment durations do not exceed applicant age.
+The four `XNA` gender values and two `Unknown` family-status values should remain unknown instead of being guessed. The very high incomes and old vehicle ages are questionable, but the data alone does not prove that they are errors. I would compare results with and without a training-based cap before removing any records. The checks also found no zero or negative income or credit values, no applicants with more children than family members, and no valid employment length greater than the applicant's age.
 
 ```{r}
-# Create interpretable analysis variables without overwriting source columns.
+# Create easier-to-read analysis variables without changing the raw columns.
 eda <- copy(train)
 eda[, AGE_YEARS := -DAYS_BIRTH / 365.25]
 eda[, EMPLOYED_SENTINEL := DAYS_EMPLOYED == 365243]
@@ -262,12 +264,12 @@ eda[, EXTERNAL_SCORE_COUNT := rowSums(!is.na(.SD)),
     .SDcols = c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")]
 ```
 
-## Applicant profile and outcome relationships
+## Applicant and loan relationships
 
 ### Age
 
 ```{r}
-# Bin age into interpretable decades and show both volume and outcome rate.
+# Group applicants into age bands and show the count and target rate.
 age_summary <- eda[, .(
   Applications = .N,
   Difficulty_rate = mean(TARGET)
@@ -283,19 +285,19 @@ ggplot(age_summary, aes(x = Age_band, y = Difficulty_rate)) +
   scale_fill_gradient(low = "#8ecae6", high = navy, guide = "none") +
   scale_y_continuous(labels = label_percent(), limits = c(0, 0.135)) +
   labs(
-    title = "Observed payment difficulty falls steadily with applicant age",
-    subtitle = "Rates are descriptive and may reflect correlated income, employment, or product mix",
+    title = "Payment-difficulty rates go down as applicant age increases",
+    subtitle = "Other differences in income, employment, or loan type may also affect this pattern",
     x = "Age at application (years)", y = "Observed difficulty rate",
     fill = "Applicants"
   )
 ```
 
-The observed rate declines from 11.44% among applicants aged 20–29 to 4.92% among those aged 60–69. The monotonic pattern makes age potentially predictive, but it also creates fairness and policy concerns. Age should not be interpreted causally, and model performance and decisions should be audited by age band before deployment.
+The payment-difficulty rate goes down from 11.44% for applicants ages 20 through 29 to 4.92% for applicants ages 60 through 69. This pattern makes age a possible predictor, but it also creates fairness and policy concerns. The chart does not show that age causes payment difficulty. Before a model is used, its errors and approval results should be checked for each age group.
 
 ### External source scores
 
 ```{r}
-# Use within-feature quintiles so the three differently distributed scores are comparable.
+# Split each external score into five equal-sized groups for comparison.
 external_long <- rbindlist(lapply(
   c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"),
   function(v) {
@@ -315,16 +317,16 @@ ggplot(external_long,
                      labels = c("External source 1", "External source 2", "External source 3")) +
   scale_y_continuous(labels = label_percent()) +
   labs(
-    title = "Higher external scores consistently correspond to lower observed risk",
+    title = "Higher external scores are connected to lower payment-difficulty rates",
     subtitle = "Quintile 1 contains the lowest scores and quintile 5 the highest",
     x = "Within-score quintile", y = "Observed difficulty rate", color = NULL
   )
 ```
 
-The external scores provide the strongest single-variable separation in this table. For `EXT_SOURCE_3`, the difficulty rate falls from about 16.38% in the lowest-score quintile to 3.38% in the highest; `EXT_SOURCE_1` and `EXT_SOURCE_2` show similarly ordered patterns. Because the scores are anonymized, their provenance, permissible use, stability, and overlap with protected or sensitive information need governance review. Missingness also prevents treating their observed subsets as the entire population.
+The external scores show the clearest single-variable relationship with payment difficulty. For `EXT_SOURCE_3`, the rate drops from about 16.38% in the lowest-score group to 3.38% in the highest-score group. `EXT_SOURCE_1` and `EXT_SOURCE_2` show the same general pattern. The dataset does not explain where these scores came from or how they were calculated, so Home Credit would need to confirm that they are stable, permitted, and explainable before using them. Since some of the scores are missing, the plotted applicants do not represent the full training population.
 
 ```{r}
-# Measure whether merely having more external scores is associated with the outcome.
+# Check whether the number of available external scores relates to the target.
 score_coverage <- eda[, .(
   Applications = .N,
   Difficulty_rate = mean(TARGET)
@@ -335,12 +337,12 @@ kable(score_coverage, digits = 4, format.args = list(big.mark = ","),
       caption = "External score coverage and observed payment difficulty")
 ```
 
-Applicants with all three scores available have a lower observed difficulty rate (7.30%) than those with only one (9.92%). The group with no scores is very small (172), so its 8.14% rate is unstable. Availability is potentially useful information, but it may encode access to external data rather than underlying creditworthiness.
+Applicants with all three scores have a 7.30% payment-difficulty rate, compared with 9.92% for applicants with only one score. Only 172 applicants have no external scores, so their 8.14% rate is based on too few cases for a strong conclusion. The number of available scores may help prediction, but it may also show which applicants have more information available rather than their actual ability to repay.
 
-### Selected categorical characteristics
+### Housing and education
 
 ```{r}
-# Compare sufficiently large categories; small groups can produce unstable rates.
+# Compare categories with enough applications to give more stable rates.
 category_rate <- function(variable, min_n = 1000) {
   eda[, .(Applications = .N, Difficulty_rate = mean(TARGET)), by = variable][
     Applications >= min_n][order(Difficulty_rate)]
@@ -355,16 +357,16 @@ ggplot(housing, aes(x = reorder(NAME_HOUSING_TYPE, Difficulty_rate),
   coord_flip(clip = "off") +
   scale_y_continuous(labels = label_percent(), limits = c(0, 0.14)) +
   labs(
-    title = "Housing categories differ in observed payment difficulty",
+    title = "Payment-difficulty rates vary by housing type",
     subtitle = "Only categories with at least 1,000 training applications are shown",
     x = NULL, y = "Observed difficulty rate"
   )
 ```
 
-Applicants in rented housing (12.31%) or living with parents (11.70%) have higher observed rates than those in a house or apartment (7.80%). This relationship may be useful for prediction but is intertwined with age, income, geography, and loan type. Multivariable analysis is required, and policy owners should review whether and how housing variables may be used.
+Applicants in rented apartments have a 12.31% payment-difficulty rate, and applicants living with parents have an 11.70% rate. The rate is 7.80% for applicants living in a house or apartment. Housing type could help prediction, but it is also connected to age, income, location, and loan type. A model would need to consider these variables together, and Home Credit would need to decide whether housing information is appropriate to use.
 
 ```{r}
-# Show large education categories with their sample sizes to keep rate comparisons honest.
+# Show education groups with at least 1,000 applications and include their counts.
 education <- category_rate("NAME_EDUCATION_TYPE")
 ggplot(education, aes(x = reorder(NAME_EDUCATION_TYPE, Difficulty_rate),
                       y = Difficulty_rate)) +
@@ -374,18 +376,18 @@ ggplot(education, aes(x = reorder(NAME_EDUCATION_TYPE, Difficulty_rate),
   coord_flip(clip = "off") +
   scale_y_continuous(labels = label_percent(), limits = c(0, 0.125)) +
   labs(
-    title = "Education level is associated with observed difficulty",
+    title = "Payment-difficulty rates vary by education level",
     subtitle = "Only categories with at least 1,000 training applications are shown",
     x = NULL, y = "Observed difficulty rate"
   )
 ```
 
-The observed rate ranges from 5.36% for higher education to 10.93% for lower secondary education among adequately sized categories. As with housing, this is association rather than cause. Education can act as a socioeconomic proxy, so fairness review and comparison with a model excluding sensitive proxies are appropriate.
+Among the larger education groups, the payment-difficulty rate ranges from 5.36% for higher education to 10.93% for lower secondary education. This is a relationship in the data and does not show that education causes the difference. Education may also represent other economic differences between applicants. I would compare model results with and without this type of information and check whether it creates unfair differences in decisions.
 
-### Loan size and affordability ratios
+### Loan amounts and income ratios
 
 ```{r}
-# Trim only for visualization so a few extreme incomes do not compress the plot.
+# Limit the plot to the 99th percentile so a few extreme values do not hide the pattern.
 amount_plot <- melt(
   eda[, .(
     TARGET,
@@ -405,16 +407,16 @@ ggplot(amount_plot, aes(x = Amount, fill = Outcome)) +
   scale_fill_manual(values = c(navy, coral)) +
   scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
   labs(
-    title = "Income and credit distributions overlap substantially across outcomes",
+    title = "Income and credit amounts overlap across the two target groups",
     subtitle = "Display is limited to the within-measure 99th percentile; no rows are removed from analysis",
     x = "Amount", y = "Density", fill = "Observed outcome"
   )
 ```
 
-Raw income and credit amount alone show extensive overlap. This suggests that relative affordability features may be more meaningful than absolute currency values, while also warning against interpreting a high income as automatically low risk.
+The income and credit distributions overlap across the two target groups. Income or loan amount by itself does not clearly separate applicants with and without payment difficulties. Ratios that compare the requested loan or annuity with income may be more useful than the original amounts, but a high income does not automatically mean low risk.
 
 ```{r}
-# Summarize engineered ratios and their simple point-biserial correlations with TARGET.
+# Summarize the new ratios and their simple correlations with TARGET.
 ratio_summary <- data.table(
   Feature = c("Credit / income", "Annuity / income", "Credit / goods price"),
   Median = c(
@@ -433,16 +435,16 @@ ratio_summary <- data.table(
     cor(eda$CREDIT_GOODS_RATIO, eda$TARGET, use = "complete.obs")
   )
 )
-kable(ratio_summary, digits = 3, caption = "Candidate affordability features")
+kable(ratio_summary, digits = 3, caption = "Possible income and loan ratio features")
 ```
 
-The ratio summaries are plausible feature-engineering candidates, but their linear correlations are weak. The credit-to-goods-price ratio has the clearest association of the three. A flexible model may capture nonlinearities and interactions, but each ratio needs guarded division, missing-value handling, and fold-specific treatment of extremes.
+These ratios could be used as new model features, but their simple linear correlations with `TARGET` are weak. The credit-to-goods-price ratio has the largest correlation of the three. A model may still find patterns that a simple correlation misses. Before using the ratios, I will need to handle missing denominators, check for division problems, and decide how to treat extreme values using only each training fold.
 
-## Numeric feature screening
+## Numeric relationships with the target
 
 ```{r}
-# Rank numeric variables by absolute point-biserial correlation as a screening tool.
-# Correlation is not feature importance and does not capture nonlinear relationships.
+# Rank numeric variables by the size of their correlation with TARGET.
+# This is only a first check and is not the same as model feature importance.
 numeric_features <- setdiff(
   names(eda)[vapply(eda, is.numeric, logical(1))],
   c("TARGET", "SK_ID_CURR")
@@ -462,23 +464,23 @@ ggplot(top_correlations,
   coord_flip() +
   scale_fill_manual(values = c(teal, coral)) +
   labs(
-    title = "External scores lead simple numeric association screening",
+    title = "External scores have the strongest simple numeric relationships",
     subtitle = "Positive values correspond to higher observed payment difficulty",
     x = NULL, y = "Point-biserial correlation with TARGET"
   )
 ```
 
-The three external scores have the largest absolute correlations (about −0.16 to −0.18). Age, regional rating, phone-change recency, and identity-document recency are smaller signals. `DAYS_EMPLOYED` appears in the ranking only after being contaminated by its sentinel; models should use the cleaned duration and sentinel indicator instead. Correlation is only a screen: it misses nonlinear patterns, interactions, and information in categorical features.
+The three external scores have the largest correlations with `TARGET`, with absolute values between about 0.16 and 0.18. Age, regional rating, the time since the last phone change, and the time since the identity document was issued have smaller relationships. The original `DAYS_EMPLOYED` column is affected by the impossible 365,243 value, so the model should use the cleaned employment length and the separate code flag instead. This correlation check is only a starting point because it does not find curved relationships, combinations of variables, or information in categorical columns.
 
-## Training and scoring population comparison
+## Training and test data comparison
 
-The test file is not a random holdout labeled for local evaluation; it is the separate cohort to be scored. Population differences therefore matter even when column names match.
+The test file is not a labeled random sample that can be used for local model evaluation. It is a separate group of applications that the final model will score. Because of this, differences between the two files matter even when they contain the same predictor columns.
 
 ```{r}
-# Compare the most visibly shifted categorical field in the two cohorts.
+# Compare the loan-type mix in the training and test files.
 contract_mix <- rbindlist(list(
   train[, .(Applications = .N), by = NAME_CONTRACT_TYPE][, Dataset := "Training"],
-  test[,  .(Applications = .N), by = NAME_CONTRACT_TYPE][, Dataset := "Scoring"]
+  test[,  .(Applications = .N), by = NAME_CONTRACT_TYPE][, Dataset := "Test"]
 ))
 contract_mix[, Share := Applications / sum(Applications), by = Dataset]
 
@@ -489,16 +491,16 @@ ggplot(contract_mix, aes(x = Dataset, y = Share, fill = NAME_CONTRACT_TYPE)) +
   scale_fill_manual(values = c(navy, gold)) +
   scale_y_continuous(labels = label_percent()) +
   labs(
-    title = "The scoring cohort contains far fewer revolving loans",
-    subtitle = "Loan-type mix shifts even though schemas align",
+    title = "The test data contains fewer revolving loans",
+    subtitle = "The files have the same predictor columns but a different loan-type mix",
     x = NULL, y = "Share of applications", fill = "Contract type"
   )
 ```
 
-Revolving loans account for 9.52% of training applications but only 0.90% of scoring applications. Median credit is also lower in the scoring data (450,000 versus 513,531), while median income is higher (157,500 versus 147,150). These differences can change calibration and the contribution of product-related features.
+Revolving loans make up 9.52% of the training applications but only 0.90% of the test applications. The median credit amount is also lower in the test data, at 450,000 compared with 513,531 in training. Median income is higher in the test data, at 157,500 compared with 147,150. These differences could affect the model's predicted probabilities and the importance of loan-product variables.
 
 ```{r}
-# Quantify selected cohort differences with directly interpretable summaries.
+# Summarize selected differences between the training and test files.
 cohort_summary <- data.table(
   Measure = c(
     "Revolving loan share",
@@ -537,48 +539,48 @@ cohort_display <- cohort_summary[, .(
     pct(Scoring[4:5], 0.01)
   )
 )]
-kable(cohort_display, caption = "Selected training-versus-scoring cohort comparisons")
+kable(cohort_display, caption = "Selected comparisons between training and test data")
 ```
 
-`EXT_SOURCE_1` is notably more complete in scoring data (42.12% missing versus 56.38% in training). These shifts do not make modeling impossible, but they argue for product-stratified validation, cohort-drift reporting, and calibration monitoring. Rare labels present only in training (`XNA`, `Unknown`, and `Maternity leave`) also require an encoder that can safely handle unseen or absent categories.
+`EXT_SOURCE_1` has fewer missing values in the test data, with 42.12% missing compared with 56.38% in training. These differences do not prevent the project from moving forward, but they mean validation should be checked by contract type and the final model should be monitored for changes in its predictions. The training data also contains rare labels that are not in the test data, including `XNA`, `Unknown`, and `Maternity leave`. The encoding method will need to handle categories that are missing from one dataset or appear later in new data.
 
-## Preparation decisions informed by EDA
+## Data preparation decisions
 
 | Finding | Preparation decision | Validation safeguard |
 |---|---|---|
-| One row per applicant and unique IDs | Keep `SK_ID_CURR` only as an identifier; do not use it as a predictor | Assert key uniqueness after every merge |
-| `TARGET` exists only in training | Separate outcome before any preprocessing | Fit every transform on training folds only |
-| 8.07% positive class | Use stratified resampling; consider weights in candidate models | Report ROC AUC, PR AUC, calibration, confusion matrix, and business threshold metrics |
-| Structured, high missingness | Compare native missing handling with fold-specific imputation; add selected missing indicators | Audit performance by missingness pattern and cohort |
-| `DAYS_EMPLOYED = 365243` sentinel | Recode to missing, retain a sentinel flag, convert valid duration to years | Test that no positive durations remain in cleaned field |
-| Skewed currency values and extreme observations | Use log/robust transforms or tree models; cap only from training-fold estimates if needed | Compare capped and uncapped sensitivity results |
-| Strong external-score signal with incomplete coverage | Retain scores and score-count indicators, subject to governance | Evaluate models with and without external scores |
-| Train/test product and coverage shift | Add product-aware validation and drift monitoring | Report performance by contract type and recalibrate if needed |
-| Socioeconomic and demographic proxies | Avoid causal claims and audit disparate errors | Compare subgroup calibration and false-positive/false-negative rates |
+| One row per applicant and unique IDs | Keep `SK_ID_CURR` as an identifier and do not use it as a predictor | Check that IDs stay unique after every merge |
+| `TARGET` is only in training | Separate the target before preparing predictors | Fit every preparation step on the training folds only |
+| Only 8.07% of cases have `TARGET = 1` | Keep the target percentage similar across folds and test model weights if needed | Report ROC AUC, PR AUC, calibration, a confusion matrix, and approval-threshold results |
+| Many related fields are missing | Compare models that handle missing values with training-fold imputation and selected missing-value flags | Check results for different missing-data groups and for the test population |
+| `DAYS_EMPLOYED = 365243` is an impossible code | Replace it with missing, keep a separate flag, and convert valid values to years | Confirm that the cleaned employment field has no positive day values |
+| Monetary values are skewed and contain extremes | Compare log or robust transformations with tree models; only cap values using training-fold cutoffs | Compare results with and without capped values |
+| External scores are useful but incomplete | Keep the scores and a count of available scores if Home Credit can explain and use them | Compare models with and without the external scores |
+| Loan type and score coverage differ between train and test | Check validation results by contract type and monitor future population changes | Report performance by contract type and recalibrate if necessary |
+| Some fields may represent demographic or economic differences | Do not treat group differences as causes and check the model for unfair errors | Compare calibration and false-positive and false-negative rates by group |
 
-This plan keeps data-quality decisions visible and testable. It also avoids a common EDA failure: using the full labeled data to choose imputation, outlier, or encoding parameters before cross-validation.
+These decisions give me a clear preparation plan that can be checked during modeling. They also prevent the full labeled dataset from influencing imputation, outlier cutoffs, or category encoding before cross-validation.
 
-## Results and implications
+## Results and next steps
 
-1. **The application tables have a clean grain but require join discipline.** Each row is a unique current application. Future one-to-many sources must be aggregated before joining, or application rows and outcome rates will be duplicated.
-2. **The outcome is strongly imbalanced.** Payment difficulties occur in 24,825 of 307,511 training cases (8.07%). Accuracy is unsuitable by itself; ranking, precision-recall, calibration, and threshold economics are required.
-3. **Missingness is a central feature of the data-generating process.** Forty-one fields exceed 50% missingness, particularly property fields, and missingness rates differ by outcome. Missing indicators and native missing-value models deserve comparison.
-4. **Several values need explicit cleaning.** The 365,243 employment-day code is impossible and widespread; rare invalid categorical labels and extreme monetary values also require consistent treatment.
-5. **External scores and age have the clearest descriptive relationships.** All three external scores separate outcome rates monotonically across quintiles, while observed difficulty decreases steadily across age bands. These variables require governance and fairness review, not just predictive evaluation.
-6. **Simple loan amounts are not enough.** Income and credit distributions overlap substantially across outcomes, and straightforward affordability ratios have weak linear relationships. Nonlinear models and interactions are likely to be useful.
-7. **Generalization risk is visible before modeling.** The scoring cohort has a sharply different contract mix, smaller median credit, higher median income, and different external-score coverage. Validation should mimic those shifts where possible and monitor calibration by product.
+1. **The application files have one row per applicant.** Each `SK_ID_CURR` is unique. Any supplementary table with several records per applicant must be summarized before it is joined to the application data.
+2. **The target is imbalanced.** There are 24,825 difficult-payment cases out of 307,511 training applications, which is 8.07%. Accuracy by itself will not show whether a model is useful.
+3. **Missing values are an important part of the data.** Forty-one fields are more than 50% missing, especially the property fields. Missing rates also differ between the two target groups, so I will compare missing-value flags, imputation, and models that handle missing values directly.
+4. **Some values need to be cleaned.** The 365,243 employment-day code is impossible and appears often. Rare invalid labels and extreme monetary values also need consistent rules.
+5. **External scores and age have the clearest individual relationships with the target.** Payment-difficulty rates go down as the external scores increase and as age increases. Before using these variables, Home Credit would need to review whether they are explainable and whether they create unfair differences.
+6. **Income and loan amount do not separate the target groups by themselves.** Their distributions overlap, and the three income and credit ratios have weak linear correlations with `TARGET`. Models that can find curved relationships and interactions may work better.
+7. **The training and test applications are different.** The test file has fewer revolving loans, a lower median credit amount, a higher median income, and different external-score coverage. Validation and monitoring should check whether these differences change model performance.
 
-Overall, the EDA supports a classification workflow that begins with a transparent baseline (regularized logistic regression) and compares it with a missing-aware tree-boosting model. A final approach should be selected on out-of-fold discrimination, calibration, operational tradeoffs, stability across contract types, and fairness diagnostics—not on a single aggregate score.
+For modeling, I would first build a regularized logistic regression as a simple baseline. I would then compare it with a tree-boosting model that can handle missing values and nonlinear relationships. I would choose the final approach based on cross-validation results, calibration, approval tradeoffs, results by contract type, and fairness checks instead of choosing it from one score alone.
 
-## How AI was used
+## How I used AI
 
-Generative AI was used as a coding and editorial assistant to help translate the business statement into EDA questions, draft reproducible R code, suggest data-quality checks, and organize the narrative. It was especially useful for quickly proposing audits for grain, missingness, sentinel values, class imbalance, and train/test drift, and for turning raw output into candidate interpretations.
+I used generative AI to help turn the business problem into possible EDA questions, write and revise R code, suggest data-quality checks, and organize the notebook. It helped me check the data grain, missing values, unusual codes, target imbalance, and differences between the training and test files. AI proposed the five EDA questions based on the business problem, assignment instructions, and data structure. I used those questions to organize the analysis.
 
-The process also required active verification. Every reported count, percentage, plot, and table was produced by executing the notebook against the supplied CSV files; column meanings were checked against the provided data dictionary; and claims were narrowed when the evidence was only associational. AI suggestions that would have implied causality, treated suspicious outliers as certain errors, or recommended preprocessing outside cross-validation were not accepted. The main benefit was speed and breadth of checks; the main risk was confident-sounding interpretation without enough domain context. Reproducible execution and human review remain necessary before modeling or decision use.
+AI made it faster to create a broad set of checks, but I still needed to verify the work. Every count, percentage, table, and plot in this notebook was produced by running the code on the supplied CSV files. I also checked column meanings against the provided data dictionary. I avoided conclusions that claimed a variable caused payment difficulty, and I did not automatically delete values just because they looked unusual. The main benefit of AI was speed. The main risk was that an explanation could sound confident even when the data did not provide enough context, so the analysis still required review before it could be used for modeling or loan decisions.
 
 ## Reproducibility
 
 ```{r}
-# Record the software environment so another analyst can investigate differences.
+# Record the software versions used to run this notebook.
 sessionInfo()
 ```
