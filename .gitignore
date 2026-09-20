@@ -1,0 +1,23 @@
+# Data and generated artifacts
+data/raw/*.csv
+data/interim/*
+data/processed/*
+models/*
+submissions/*
+reports/figures/*
+reports/metrics/*
+
+# Keep directory placeholders
+!.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Editors and operating systems
+.DS_Store
+.vscode/
+.idea/
