@@ -1,0 +1,820 @@
+---
+title: "Home Credit Default Risk: Modeling"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Purpose
+
+Home Credit wants to predict, at the time of application, which applicants are likely to have payment difficulties, so that it can reduce default losses and still approve creditworthy applicants with thin credit files. This notebook builds and compares models that estimate each applicant's probability of default, and it uses **AUC** (area under the ROC curve) as the yardstick. AUC measures how well a model ranks defaulters above non-defaulters: 0.5 is no better than a coin flip and 1.0 is a perfect ranking. It is the metric Kaggle uses for this competition, and unlike accuracy it is not fooled by the fact that only about 8% of applicants default.
+
+The notebook follows the assignment steps: a benchmark, a comparison of candidate models, an experiment with class-imbalance strategies, randomized hyperparameter tuning, and a final model that produces a Kaggle submission. The modeling functions are defined in the collapsed code block directly below, and the cleaning and feature engineering functions come from `src/data_preparation.R` (the previous assignment).
+
+```{r setup}
+library(data.table)
+library(ggplot2)
+
+# SMOKE = TRUE is a tiny, fast version I use only to test that the notebook runs
+# from start to finish. Every reported result comes from the full version (SMOKE = FALSE).
+SMOKE <- Sys.getenv("MODELING_SMOKE") == "1"
+
+cfg <- list(
+  compare_n = if (SMOKE) 6000 else 40000,   # rows for the model comparisons
+  tune_n    = if (SMOKE) 3000 else 10000,   # rows for tuning
+  n_search  = if (SMOKE) 3 else 20,         # random search iterations
+  final_n   = if (SMOKE) 15000 else NA,     # NA = train the final model on all training rows
+  seed      = 2026
+)
+
+# Find the repo root. The notebook can run from notebooks/ or from the repo root
+# (for example when I run chunks in Positron).
+root <- if (file.exists("src/data_preparation.R")) "." else ".."
+if (!file.exists(file.path(root, "src/data_preparation.R"))) {
+  stop("Could not find src/data_preparation.R. Open the repo folder (the one that ",
+       "contains src/, data/ and notebooks/) as your working directory. Current folder: ", getwd())
+}
+
+# Slow steps are saved to disk (models/cache is git-ignored). Editing the text and
+# re-rendering then skips the 40+ minutes of computation.
+cache_dir <- file.path(root, if (SMOKE) "models/cache_smoke" else "models/cache")
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+cached <- function(name, expr) {
+  f <- file.path(cache_dir, paste0(name, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  res <- expr                       # expr only runs when there is no saved result
+  saveRDS(res, f)
+  res
+}
+
+SKIP_PIPELINE <- TRUE   # load the functions only; skip the standalone pipeline
+source(file.path(root, "src/data_preparation.R"))
+
+train <- fread(file.path(root, "data/raw/application_train.csv"))
+test  <- fread(file.path(root, "data/raw/application_test.csv"))
+```
+
+## Modeling functions
+
+The functions used throughout this notebook are defined here once so the sections below stay readable. Click "Show code" to expand them. The leakage rules they enforce are listed at the top of the block.
+
+```{r modeling-functions}
+#| code-fold: true
+#| code-summary: "Show the modeling functions"
+# =============================================================================
+# Modeling functions
+#
+# These functions build, compare, tune and score the models for the Home Credit
+# Default Risk project. They use the functions from src/data_preparation.R,
+# which is sourced above.
+#
+# Three rules keep validation data from leaking into training:
+#   1. Cross-validation runs on the raw application rows. For every fold,
+#      fit_preprocessing() (medians, bin edges) is re-fit on that fold's training
+#      rows only, then applied to both the training and validation rows.
+#   2. fit_model_spec() (imputation medians, category levels) is also fit on
+#      training rows only.
+#   3. Class-imbalance resampling changes the training rows only. Validation rows
+#      are never resampled, so AUC reflects the real default rate of about 8%.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+})
+
+stopifnot(exists("apply_preprocessing"), exists("fit_preprocessing"))  # data_preparation.R must be sourced first
+
+# -----------------------------------------------------------------------------
+# 1. Evaluation helpers
+# -----------------------------------------------------------------------------
+
+fast_auc <- function(y, p) {
+  # Rank-based (Mann-Whitney) AUC. Ties get the average rank, so a constant
+  # prediction (like the majority-class benchmark) scores exactly 0.5.
+  r  <- rank(p, ties.method = "average")
+  n1 <- sum(y == 1)
+  n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+accuracy_at <- function(y, p, threshold = 0.5) mean((p >= threshold) == (y == 1))
+
+# -----------------------------------------------------------------------------
+# 2. Feature sets and the model design (imputed predictor table)
+# -----------------------------------------------------------------------------
+
+ID_TARGET <- c("SK_ID_CURR", "TARGET")
+
+# Columns created in data_preparation.R. Every other column is a raw application column.
+ENGINEERED_COLS <- c(
+  "EMPLOYED_SENTINEL", "EMPLOYED_YEARS", "AGE_YEARS",
+  "CREDIT_INCOME_RATIO", "ANNUITY_INCOME_RATIO", "CREDIT_GOODS_RATIO",
+  "EXTERNAL_SOURCE_COUNT", "AGE_BAND", "CREDIT_INCOME_QUINTILE",
+  "AGE_X_EMPLOYED", "DTI_X_EXT_COUNT",
+  paste0(c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
+           "AMT_ANNUITY", "AMT_GOODS_PRICE", "OCCUPATION_TYPE"), "_MISSING")
+)
+
+# Predictor sets. Each one is a list of the columns to keep or drop.
+feature_set_columns <- function(prepped, set = c("engineered", "raw", "ext_only", "engineered_no_demog")) {
+  set <- match.arg(set)
+  all_cols <- setdiff(names(prepped), ID_TARGET)
+  switch(set,
+    # Full engineered set. I drop the raw DAYS_BIRTH and DAYS_EMPLOYED columns
+    # because AGE_YEARS, EMPLOYED_YEARS and EMPLOYED_SENTINEL replace them
+    # (EDA decision: DAYS_EMPLOYED = 365243 is a placeholder, not a real tenure).
+    engineered = setdiff(all_cols, c("DAYS_BIRTH", "DAYS_EMPLOYED")),
+    # Raw application columns only. No engineered features, and the placeholder stays.
+    raw        = setdiff(all_cols, ENGINEERED_COLS),
+    # Smallest benchmark: the three external scores only.
+    ext_only   = c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"),
+    # Engineered set without the demographic fields flagged for fair-lending review
+    # in the feature report (gender, family status, children, family members).
+    engineered_no_demog = setdiff(all_cols, c("DAYS_BIRTH", "DAYS_EMPLOYED", "CODE_GENDER",
+                                              "NAME_FAMILY_STATUS", "CNT_CHILDREN", "CNT_FAM_MEMBERS"))
+  )
+}
+
+fit_model_spec <- function(prepped_train, cols) {
+  # Learns from the training rows only how to turn the prepared columns into a
+  # complete table: medians for numeric columns and levels for categorical ones.
+  is_cat   <- vapply(cols, function(f) is.character(prepped_train[[f]]) || is.factor(prepped_train[[f]]), logical(1))
+  cat_cols <- cols[is_cat]
+  num_cols <- cols[!is_cat]
+
+  medians <- vapply(num_cols, function(f) {
+    x <- as.numeric(prepped_train[[f]])
+    x[!is.finite(x)] <- NA
+    m <- median(x, na.rm = TRUE)
+    if (is.na(m)) 0 else m
+  }, numeric(1))
+
+  cat_levels <- lapply(cat_cols, function(f) {
+    x <- as.character(prepped_train[[f]])
+    sort(unique(x[!is.na(x) & x != ""]))     # blank text counts as missing
+  })
+  names(cat_levels) <- cat_cols
+
+  list(cols = cols, num_cols = num_cols, cat_cols = cat_cols,
+       medians = medians, cat_levels = cat_levels)
+}
+
+apply_model_spec <- function(prepped, spec) {
+  # Applies a fitted spec. Missing numeric values get the training median. Missing
+  # categories, and categories not seen in training, get a "Missing" level. The
+  # levels come from the spec, so train and test always end up with the same columns.
+  out <- vector("list", length(spec$cols))
+  names(out) <- spec$cols
+  for (f in spec$num_cols) {
+    x <- as.numeric(prepped[[f]])
+    x[!is.finite(x)] <- spec$medians[[f]]
+    out[[f]] <- x
+  }
+  for (f in spec$cat_cols) {
+    x <- as.character(prepped[[f]])
+    lv <- spec$cat_levels[[f]]
+    x[is.na(x) | x == "" | !(x %in% lv)] <- "Missing"
+    out[[f]] <- factor(x, levels = c(lv, "Missing"))
+  }
+  as.data.frame(out, check.names = FALSE)
+}
+
+to_sparse <- function(design) {
+  # One-hot encoding with all factor levels kept, as a sparse matrix for glmnet.
+  cat_cols <- names(design)[vapply(design, is.factor, logical(1))]
+  contr <- lapply(cat_cols, function(f) contrasts(design[[f]], contrasts = FALSE))
+  names(contr) <- cat_cols
+  Matrix::sparse.model.matrix(~ . - 1, data = design, contrasts.arg = contr)
+}
+
+# -----------------------------------------------------------------------------
+# 3. Cross-validation data: leakage-safe folds
+# -----------------------------------------------------------------------------
+
+stratified_sample <- function(raw, n, seed = 1) {
+  # Random sample of n rows that keeps the same share of TARGET = 1.
+  set.seed(seed)
+  idx1 <- which(raw$TARGET == 1); idx0 <- which(raw$TARGET == 0)
+  n1 <- round(n * length(idx1) / nrow(raw))
+  raw[sort(c(sample(idx1, n1), sample(idx0, n - n1)))]
+}
+
+make_cv_data <- function(raw, k = 3, seed = 42) {
+  # Splits the raw rows into k stratified folds. For each fold, the preparation
+  # statistics are re-fit on the training part only.
+  set.seed(seed)
+  fold_id <- integer(nrow(raw))
+  for (cls in c(0, 1)) {
+    idx <- which(raw$TARGET == cls)
+    fold_id[idx] <- sample(rep_len(seq_len(k), length(idx)))
+  }
+  lapply(seq_len(k), function(i) {
+    tr <- raw[fold_id != i]
+    va <- raw[fold_id == i]
+    st <- fit_preprocessing(tr)
+    list(train = apply_preprocessing(tr, st, is_train = TRUE),
+         valid = apply_preprocessing(va, st, is_train = FALSE),
+         y_train = tr$TARGET, y_valid = va$TARGET)
+  })
+}
+
+# -----------------------------------------------------------------------------
+# 4. Class-imbalance strategies (training rows only)
+# -----------------------------------------------------------------------------
+
+resample_train <- function(X, y, strategy = c("none", "weights", "downsample", "upsample", "smote"),
+                           ratio = 1, seed = 1) {
+  # Returns list(X, y, w). `ratio` is the target ratio of repaid to default rows
+  # for downsampling and upsampling (1 = fully balanced).
+  strategy <- match.arg(strategy)
+  set.seed(seed)
+  n1 <- sum(y == 1); n0 <- sum(y == 0)
+  idx1 <- which(y == 1); idx0 <- which(y == 0)
+
+  if (strategy == "none") return(list(X = X, y = y, w = NULL))
+
+  if (strategy == "weights") {
+    # No rows are added or removed. Each default counts n0/n1 times as much.
+    return(list(X = X, y = y, w = ifelse(y == 1, n0 / n1, 1)))
+  }
+  if (strategy == "downsample") {
+    keep <- c(idx1, sample(idx0, min(n0, round(n1 * ratio))))
+    return(list(X = X[keep, , drop = FALSE], y = y[keep], w = NULL))
+  }
+  if (strategy == "upsample") {
+    extra <- sample(idx1, max(0, round(n0 / ratio) - n1), replace = TRUE)
+    keep <- c(seq_along(y), extra)
+    return(list(X = X[keep, , drop = FALSE], y = y[keep], w = NULL))
+  }
+  if (strategy == "smote") {
+    # SMOTE creates new default rows by interpolating between neighboring default
+    # rows. It needs numeric predictors only, so X cannot contain factor columns.
+    stopifnot(!any(vapply(X, is.factor, logical(1))))
+    d <- X; d$.y <- factor(ifelse(y == 1, "p", "n"), levels = c("n", "p"))
+    d <- themis::smote(d, var = ".y", k = 5, over_ratio = 1 / ratio)
+    return(list(X = d[, setdiff(names(d), ".y"), drop = FALSE],
+                y = as.integer(d$.y == "p"), w = NULL))
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 5. Model constructors
+#    Each one returns a function(X, y, w) that fits a model and returns a
+#    predict function(Xnew) that gives the probability of default.
+# -----------------------------------------------------------------------------
+
+model_glm <- function() {
+  function(X, y, w = NULL) {
+    d <- cbind(X, .y = y)
+    m <- suppressWarnings(glm(.y ~ ., data = d, family = binomial(), weights = w))
+    function(Xnew) as.numeric(suppressWarnings(predict(m, Xnew, type = "response")))
+  }
+}
+
+model_glmnet <- function(alpha = 0.5) {
+  function(X, y, w = NULL) {
+    # nlambda = 20 and lambda.min.ratio = 1e-3 give a coarser penalty path than the
+    # default 100 values. The AUC was the same (0.7449 vs 0.7448) in about a third of the time.
+    m <- glmnet::cv.glmnet(to_sparse(X), y, family = "binomial", alpha = alpha,
+                           nfolds = 3, weights = w, type.measure = "auc",
+                           nlambda = 20, lambda.min.ratio = 1e-3)
+    function(Xnew) as.numeric(predict(m, to_sparse(Xnew), s = "lambda.1se", type = "response"))
+  }
+}
+
+model_ranger <- function(num.trees = 200, mtry = NULL, min.node.size = 50,
+                         max.depth = 12, sample.fraction = 0.7, seed = 1) {
+  function(X, y, w = NULL) {
+    d <- cbind(X, .y = factor(ifelse(y == 1, "p", "n"), levels = c("n", "p")))
+    m <- ranger::ranger(dependent.variable.name = ".y", data = d, probability = TRUE,
+                        num.trees = num.trees, mtry = mtry, min.node.size = min.node.size,
+                        max.depth = max.depth, sample.fraction = sample.fraction,
+                        respect.unordered.factors = "order", num.threads = 2, seed = seed)
+    function(Xnew) predict(m, Xnew, num.threads = 2)$predictions[, "p"]
+  }
+}
+
+model_gbm <- function(n.trees = 300, interaction.depth = 4, shrinkage = 0.05,
+                      n.minobsinnode = 50, bag.fraction = 0.7, seed = 1) {
+  function(X, y, w = NULL) {
+    set.seed(seed)
+    m <- suppressWarnings(gbm::gbm.fit(x = X, y = y, w = w, distribution = "bernoulli",
+                      n.trees = n.trees, interaction.depth = interaction.depth,
+                      shrinkage = shrinkage, n.minobsinnode = n.minobsinnode,
+                      bag.fraction = bag.fraction, verbose = FALSE, keep.data = FALSE))
+    f <- function(Xnew) as.numeric(predict(m, Xnew, n.trees = n.trees, type = "response"))
+    # Relative influence of each predictor (adds up to 100). I use it to explain the final model.
+    attr(f, "importance") <- function() {
+      imp <- summary(m, n.trees = n.trees, plotit = FALSE)
+      data.frame(feature = as.character(imp$var), influence = imp$rel.inf)
+    }
+    f
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Parallel helper
+#   Runs FUN over X on several R processes. It starts fresh R sessions (a PSOCK
+#   cluster) and does not fork, because Positron blocks forking and Windows does
+#   not support it. Each worker loads the packages it needs and gets a copy of
+#   the functions defined in this notebook.
+# -----------------------------------------------------------------------------
+
+par_lapply <- function(X, FUN, cores = 1) {
+  if (cores <= 1 || length(X) <= 1) return(lapply(X, FUN))
+  cl <- parallel::makeCluster(min(cores, length(X)))
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  parallel::clusterEvalQ(cl, {
+    suppressPackageStartupMessages({ library(data.table); library(Matrix) })
+    data.table::setDTthreads(1)
+    NULL
+  })
+  # Copy the functions and small constants to the workers. Skip the large data objects.
+  keep <- Filter(function(n) {
+    obj <- get(n, envir = globalenv())
+    is.function(obj) || as.numeric(object.size(obj)) < 1e6
+  }, ls(globalenv()))
+  parallel::clusterExport(cl, keep, envir = globalenv())
+  parallel::parLapply(cl, X, FUN)
+}
+
+# -----------------------------------------------------------------------------
+# 6. Cross-validated evaluation
+# -----------------------------------------------------------------------------
+
+cv_evaluate <- function(cv_data, model_fn, features = "engineered",
+                        imbalance = "none", ratio = 1, numeric_only = FALSE, seed = 1,
+                        cores = 1) {
+  # Fits `model_fn` on each fold's training rows (after any resampling) and scores
+  # the untouched validation rows. Returns one row per fold.
+  rows <- par_lapply(seq_along(cv_data), function(i) {
+    fold <- cv_data[[i]]
+    cols <- feature_set_columns(fold$train, features)
+    spec <- fit_model_spec(fold$train, cols)
+    if (numeric_only) { spec <- fit_model_spec(fold$train, spec$num_cols) }
+    Xtr <- apply_model_spec(fold$train, spec)
+    Xva <- apply_model_spec(fold$valid, spec)
+
+    rs <- resample_train(Xtr, fold$y_train, imbalance, ratio, seed = seed + i)
+    t0 <- Sys.time()
+    predict_fn <- model_fn(rs$X, rs$y, rs$w)
+    p <- predict_fn(Xva)
+    data.frame(fold = i,
+               auc = fast_auc(fold$y_valid, p),
+               accuracy = accuracy_at(fold$y_valid, p),
+               seconds = as.numeric(difftime(Sys.time(), t0, units = "secs")))
+  }, cores = cores)
+  bad <- vapply(rows, function(r) inherits(r, "try-error") || !is.data.frame(r), logical(1))
+  if (any(bad)) stop("cv_evaluate failed on a fold: ", paste(unlist(rows[bad]), collapse = "; "))
+  do.call(rbind, rows)
+}
+
+summarise_cv <- function(res, label) {
+  data.frame(model = label,
+             cv_auc = mean(res$auc), auc_sd = sd(res$auc),
+             accuracy = mean(res$accuracy), seconds = sum(res$seconds))
+}
+
+# -----------------------------------------------------------------------------
+# 7. Random search for gradient boosting settings
+# -----------------------------------------------------------------------------
+
+sample_gbm_params <- function(n, seed = 1) {
+  set.seed(seed)
+  data.frame(
+    shrinkage       = exp(runif(n, log(0.03), log(0.2))),
+    interaction.depth = sample(2:5, n, replace = TRUE),
+    n.minobsinnode  = sample(c(20, 50, 100, 200), n, replace = TRUE),
+    bag.fraction    = runif(n, 0.5, 0.9)
+  )
+}
+
+random_search_gbm <- function(cv_data, params, tree_grid = seq(100, 400, by = 100),
+                              imbalance = "none", features = "engineered", seed = 1,
+                              cores = 1) {
+  # For each sampled setting, I fit one model per fold with max(tree_grid) trees
+  # and score it at every tree count in tree_grid. This is cheap with boosting, so
+  # the number of trees is searched along with the other settings.
+  fold_inputs <- lapply(seq_along(cv_data), function(i) {
+    fold <- cv_data[[i]]
+    spec <- fit_model_spec(fold$train, feature_set_columns(fold$train, features))
+    Xtr  <- apply_model_spec(fold$train, spec)
+    list(Xtr = Xtr, Xva = apply_model_spec(fold$valid, spec),
+         rs = resample_train(Xtr, fold$y_train, imbalance, seed = seed + i),
+         y_valid = fold$y_valid)
+  })
+
+  out <- par_lapply(seq_len(nrow(params)), function(j) {
+    pj <- params[j, ]
+    aucs <- sapply(fold_inputs, function(fi) {
+      set.seed(seed)
+      m <- suppressWarnings(gbm::gbm.fit(x = fi$rs$X, y = fi$rs$y, w = fi$rs$w, distribution = "bernoulli",
+                        n.trees = max(tree_grid), interaction.depth = pj$interaction.depth,
+                        shrinkage = pj$shrinkage, n.minobsinnode = pj$n.minobsinnode,
+                        bag.fraction = pj$bag.fraction, verbose = FALSE, keep.data = FALSE))
+      sapply(tree_grid, function(nt)
+        fast_auc(fi$y_valid, predict(m, fi$Xva, n.trees = nt, type = "response")))
+    })                                     # matrix of tree counts by folds
+    mean_auc <- rowMeans(aucs)
+    best <- which.max(mean_auc)
+    cbind(pj, n.trees = tree_grid[best], cv_auc = mean_auc[best], iteration = j)
+  }, cores = cores)
+  bad <- vapply(out, function(r) !is.data.frame(r), logical(1))
+  if (any(bad)) stop("random_search_gbm failed on a configuration: ", paste(unlist(out[bad]), collapse = "; "))
+  res <- do.call(rbind, out)
+  res[order(-res$cv_auc), ]
+}
+
+gbm_tree_curve <- function(cv_data, params, tree_grid = seq(100, 800, by = 100),
+                           imbalance = "none", features = "engineered", seed = 1, cores = 1) {
+  # CV AUC by number of trees, for one fixed set of the other boosting settings.
+  # One model per fold is fit with max(tree_grid) trees and scored at every tree
+  # count in tree_grid. I use it to re-select the number of trees on a larger
+  # sample than the random search used, because the best number of trees grows
+  # with the amount of training data.
+  per_fold <- par_lapply(seq_along(cv_data), function(i) {
+    fold <- cv_data[[i]]
+    spec <- fit_model_spec(fold$train, feature_set_columns(fold$train, features))
+    Xtr  <- apply_model_spec(fold$train, spec)
+    Xva  <- apply_model_spec(fold$valid, spec)
+    rs   <- resample_train(Xtr, fold$y_train, imbalance, seed = seed + i)
+    set.seed(seed)
+    m <- suppressWarnings(gbm::gbm.fit(x = rs$X, y = rs$y, w = rs$w, distribution = "bernoulli",
+                                       n.trees = max(tree_grid), interaction.depth = params$interaction.depth,
+                                       shrinkage = params$shrinkage, n.minobsinnode = params$n.minobsinnode,
+                                       bag.fraction = params$bag.fraction, verbose = FALSE, keep.data = FALSE))
+    data.frame(fold = i, n.trees = tree_grid,
+               auc = sapply(tree_grid, function(nt)
+                 fast_auc(fold$y_valid, predict(m, Xva, n.trees = nt, type = "response"))))
+  }, cores = cores)
+  bad <- vapply(per_fold, function(r) !is.data.frame(r), logical(1))
+  if (any(bad)) stop("gbm_tree_curve failed on a fold: ", paste(unlist(per_fold[bad]), collapse = "; "))
+  res <- as.data.table(do.call(rbind, per_fold))
+  res[, .(cv_auc = mean(auc), auc_sd = sd(auc)), by = n.trees]
+}
+
+# -----------------------------------------------------------------------------
+# 8. Final fit on all training data and test set predictions
+# -----------------------------------------------------------------------------
+
+fit_final_and_predict <- function(train_raw, test_raw, model_fn, features = "engineered",
+                                  imbalance = "none", seed = 1) {
+  # The statistics are fit once on the full training set and reused, unchanged,
+  # on the test set. This stops with an error if train and test differ in any column.
+  st   <- fit_preprocessing(train_raw)
+  trp  <- apply_preprocessing(train_raw, st, is_train = TRUE)
+  tep  <- apply_preprocessing(test_raw,  st, is_train = FALSE)
+  chk  <- validate_train_test_consistency(trp, tep)
+  stopifnot(chk$identical)
+
+  spec <- fit_model_spec(trp, feature_set_columns(trp, features))
+  Xtr  <- apply_model_spec(trp, spec)
+  Xte  <- apply_model_spec(tep, spec)
+  stopifnot(identical(names(Xtr), names(Xte)),
+            identical(lapply(Xtr, levels), lapply(Xte, levels)))
+
+  rs <- resample_train(Xtr, train_raw$TARGET, imbalance, seed = seed)
+  predict_fn <- model_fn(rs$X, rs$y, rs$w)
+  imp <- attr(predict_fn, "importance")
+  list(test_pred = predict_fn(Xte),
+       importance = if (is.null(imp)) NULL else imp(),
+       n_features = ncol(Xtr), n_train = nrow(rs$X))
+}
+```
+
+# 1. Evaluation design
+
+The training file has `r format(nrow(train), big.mark = ",")` applicants and a default rate of `r sprintf("%.2f%%", 100 * mean(train$TARGET))`. The test file (`r format(nrow(test), big.mark = ",")` applicants) has no labels, so the only way to estimate how a model will do on new applicants is **cross-validation** on the training data.
+
+Three design choices keep those estimates honest:
+
+1. **3-fold stratified cross-validation.** Each fold keeps the same default rate, and every number below is the average over the three folds, with the fold-to-fold standard deviation shown so that small differences can be judged against noise.
+2. **Preparation is re-fit inside each fold.** The imputation medians and bin cut points from `fit_preprocessing()` are computed from that fold's training rows only, then applied unchanged to its validation rows. This is the same fit-then-apply separation that `data_preparation.R` uses for train versus test, so the validation rows never influence how the training rows are prepared.
+3. **Resampling touches training rows only.** When a class-imbalance strategy changes the training data (Section 4), the validation fold is left alone, so validation AUC always reflects the real 8% default rate.
+
+To keep the many comparisons affordable on a laptop-class machine, the model comparison and class-imbalance experiments run on a stratified random sample of `r format(cfg$compare_n, big.mark = ",")` training rows (each fold trains on about `r format(round(cfg$compare_n * 2 / 3), big.mark = ",")` of them). Tuning uses a smaller `r format(cfg$tune_n, big.mark = ",")`-row sample, and only the final model sees all training rows.
+
+```{r folds}
+comp_raw <- stratified_sample(train, cfg$compare_n, seed = cfg$seed)
+cv_comp  <- make_cv_data(comp_raw, k = 3, seed = cfg$seed)
+
+# Number of model inputs in each feature set
+fold1 <- cv_comp[[1]]$train
+n_feats <- sapply(c("ext_only", "raw", "engineered"), function(s) length(feature_set_columns(fold1, s)))
+n_feats
+```
+
+# 2. Benchmarks
+
+The **majority-class classifier** predicts "repaid" for everyone. It is the floor every real model has to beat.
+
+```{r baseline-majority}
+bench_majority <- data.frame(
+  model    = "Majority-class classifier (always predict 'repaid')",
+  cv_auc   = fast_auc(train$TARGET, rep(0, nrow(train))),   # a constant score cannot rank anyone, so AUC = 0.5
+  auc_sd   = NA_real_,
+  accuracy = mean(train$TARGET == 0),
+  seconds  = 0
+)
+knitr::kable(bench_majority[, c("model", "cv_auc", "accuracy")], digits = 4,
+             col.names = c("Benchmark", "AUC", "Accuracy"))
+```
+
+The majority classifier is `r sprintf("%.1f%%", 100 * bench_majority$accuracy)` accurate while catching **zero** defaulters, which is why accuracy is the wrong yardstick for this problem and why every model below is judged on AUC. A better "simple model" benchmark is a logistic regression on only the three external credit scores (`EXT_SOURCE_1/2/3`), which is included as the first row of the comparison in Section 3.
+
+# 3. Candidate models
+
+The candidates differ in algorithm and in which predictors they see. The three predictor sets are:
+
+- **External scores only** (3 columns): the simplest credible model.
+- **Raw application columns** (`r n_feats[["raw"]]` columns): the original application fields, with the `DAYS_EMPLOYED = 365243` placeholder left in place.
+- **Engineered features** (`r n_feats[["engineered"]]` columns): the raw fields plus everything built in `data_preparation.R` (age in years, tenure with a placeholder flag, income and loan ratios, missing-data indicators, interactions, and bins). The raw `DAYS_BIRTH` and `DAYS_EMPLOYED` columns are dropped because the engineered versions replace them.
+
+The algorithms are logistic regression (with an elastic-net penalty when there are many predictors, which shrinks unhelpful coefficients), random forests, and gradient boosting. Gradient boosting builds many small decision trees in sequence, each one correcting the errors of the previous ones. This session's R installation could not download `xgboost` or `lightgbm`, so gradient boosting uses the `gbm` package; it is the same family of model, only slower. Models start with reasonable default settings here and the best one is tuned in Section 5.
+
+```{r candidates}
+cand <- cached("candidates", {
+  run <- function(label, fn, ...) {
+    r <- cv_evaluate(cv_comp, fn, ...)
+    list(summary = summarise_cv(r, label), folds = cbind(model = label, r))
+  }
+  runs <- list(
+    run("Logistic regression, 3 external scores",       model_glm(),    features = "ext_only"),
+    run("Elastic-net logistic, raw columns",            model_glmnet(), features = "raw",        cores = 2),
+    run("Elastic-net logistic, engineered features",    model_glmnet(), features = "engineered", cores = 2),
+    run("Random forest (depth 8), engineered",         model_ranger(num.trees = 300, max.depth = 8,  min.node.size = 100), features = "engineered"),
+    run("Random forest (depth 14), engineered",        model_ranger(num.trees = 300, max.depth = 14, min.node.size = 50),  features = "engineered"),
+    run("Gradient boosting, raw columns",               model_gbm(n.trees = 300), features = "raw",        cores = 2),
+    run("Gradient boosting, engineered features",       model_gbm(n.trees = 300), features = "engineered", cores = 2)
+  )
+  list(summary = rbindlist(lapply(runs, `[[`, "summary")),
+       folds   = rbindlist(lapply(runs, `[[`, "folds")))
+})
+
+comp_tbl <- rbind(bench_majority, cand$summary)
+knitr::kable(comp_tbl[, c("model", "cv_auc", "auc_sd", "accuracy")], digits = 4,
+             col.names = c("Model", "CV AUC", "SD across folds", "Accuracy at 0.5"))
+```
+
+```{r candidates-plot, fig.height = 4.5, fig.width = 8}
+plot_df <- cand$summary
+plot_df$model <- factor(plot_df$model, levels = rev(plot_df$model))
+ggplot(plot_df, aes(x = cv_auc, y = model)) +
+  geom_pointrange(aes(xmin = cv_auc - auc_sd, xmax = cv_auc + auc_sd), colour = "#1F4E79") +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  labs(title = "Cross-validated AUC by candidate model",
+       subtitle = "Points are 3-fold means; bars show +/- 1 SD across folds; dashed line = majority-class AUC (0.5)",
+       x = "CV AUC", y = NULL) +
+  theme_minimal()
+```
+
+```{r best-candidate}
+best_candidate <- cand$summary$model[which.max(cand$summary$cv_auc)]
+best_candidate
+```
+
+Three results stand out. First, every model beats the benchmark's AUC of 0.5, and even a logistic regression on the three external scores reaches 0.715, so most of the signal is already in those columns. Second, gradient boosting on the engineered features is best at 0.7415, but the elastic-net logistic regression is close at 0.7395 and gradient boosting on the raw columns is at 0.7410. The fold-to-fold standard deviation is about 0.009 to 0.011, which is larger than these gaps, so the top three models are not clearly separable on this sample. Third, the random forests are weaker (0.7245 and 0.7199), and the deeper forest is worse than the shallower one, which suggests that the forests overfit the noisy predictors. Accuracy is about 91.9% for every model and equals the majority-class benchmark, which confirms that accuracy cannot separate these models.
+
+Gradient boosting is carried forward because it has the highest mean AUC and is the family that can use the most from tuning, not because it wins by a wide margin.
+
+# 4. Class imbalance
+
+Only about 8% of applicants default, so a model can do well on the overall loss by paying little attention to the rare class. The usual remedies change what the model sees during training:
+
+- **Class weights:** keep every row but count each default as if it were about 11 defaults.
+- **Downsampling:** keep every default and a random sample of repaid loans equal in number (1:1).
+- **Upsampling:** randomly repeat defaults until they match the number of repaid loans (1:1).
+- **SMOTE:** instead of repeating defaults, create synthetic ones by interpolating between neighbouring real defaults. SMOTE needs purely numeric inputs, so it is tested on the numeric columns only, against a numeric-only baseline.
+
+All strategies are applied inside each training fold, never to the validation fold. They are tested on the two model families that performed best.
+
+```{r imbalance}
+imb <- cached("imbalance", {
+  strategies <- c("weights", "downsample", "upsample")
+  one <- function(label, strategy, fn, ...) {
+    cbind(strategy = strategy,
+          summarise_cv(cv_evaluate(cv_comp, fn, imbalance = strategy, cores = 2, ...), label))
+  }
+  gbm_rows   <- lapply(strategies, function(s) one("Gradient boosting", s, model_gbm(n.trees = 300), features = "engineered"))
+  glmnet_rows <- lapply(strategies, function(s) one("Elastic-net logistic", s, model_glmnet(), features = "engineered"))
+  smote_rows <- list(
+    one("Elastic-net logistic, numeric columns only", "none",  model_glmnet(), features = "engineered", numeric_only = TRUE),
+    one("Elastic-net logistic, numeric columns only", "smote", model_glmnet(), features = "engineered", numeric_only = TRUE)
+  )
+  rbindlist(c(gbm_rows, glmnet_rows, smote_rows))
+})
+
+# Add the unadjusted ("none") results from Section 3
+none_rows <- cbind(strategy = "none", cand$summary[cand$summary$model %in%
+  c("Gradient boosting, engineered features", "Elastic-net logistic, engineered features"), ])
+none_rows$model <- sub(", engineered features", "", none_rows$model)
+imb_tbl <- rbind(none_rows, imb)
+imb_tbl <- imb_tbl[order(imb_tbl$model, -imb_tbl$cv_auc), ]
+knitr::kable(imb_tbl[, c("model", "strategy", "cv_auc", "auc_sd", "accuracy")], digits = 4, row.names = FALSE,
+             col.names = c("Model", "Imbalance strategy", "CV AUC", "SD across folds", "Accuracy at 0.5"))
+```
+
+Accuracy at a 0.5 cutoff drops sharply for the rebalanced models. That is expected and not a problem: after rebalancing, the model's probabilities are no longer calibrated to the real 8% default rate, so a 0.5 cutoff flags many more applicants. Only the *ranking* matters for AUC.
+
+```{r imbalance-choice}
+gbm_imb <- imb_tbl[imb_tbl$model == "Gradient boosting", ]
+best_strategy <- gbm_imb$strategy[which.max(gbm_imb$cv_auc)]
+best_strategy
+```
+
+For gradient boosting, none of the imbalance strategies beat the unadjusted model (0.7415). Upsampling (0.7393) and class weights (0.7381) are slightly lower and downsampling (0.7326) is lowest, probably because it throws away most of the repaid loans. For the elastic-net logistic regression, weights are marginally higher than no adjustment (0.7403 vs 0.7395), and SMOTE is marginally higher than its numeric-only baseline (0.7362 vs 0.7331). Each of these differences is much smaller than the fold-to-fold standard deviation of 0.007 to 0.013, so they should be read as "no meaningful change". This is consistent with AUC being a ranking measure: reweighting the classes mostly changes how probabilities are scaled, not which applicants rank above which. Imbalance handling would matter more if the model were used with a fixed cutoff, and it would then be paired with recalibration. The unadjusted gradient-boosting model is used going forward.
+
+# 5. Hyperparameter tuning
+
+The best-performing family from Section 3 is tuned with a **randomized search**: instead of trying every combination on a grid, `r cfg$n_search` random combinations are drawn from sensible ranges, and each is scored with 3-fold cross-validation. Following the assignment's speed-up guidance, the search runs on a random sample of only `r format(cfg$tune_n, big.mark = ",")` training rows. For each sampled configuration the model is fit once with 400 trees and scored at 100, 200, 300 and 400 trees, so the number of trees is searched along with the other settings. The class-imbalance strategy chosen above (`r best_strategy`) is held fixed.
+
+| Setting | What it controls | Range searched |
+|---|---|---|
+| `shrinkage` | how much each tree is allowed to change the model (learning rate) | 0.03 to 0.20 (log scale) |
+| `interaction.depth` | size of each tree | 2 to 5 |
+| `n.minobsinnode` | smallest allowed group of applicants in a tree leaf | 20, 50, 100, 200 |
+| `bag.fraction` | share of rows each tree sees | 0.5 to 0.9 |
+| `n.trees` | number of trees | 100, 200, 300, 400 |
+
+```{r tuning}
+tune_raw <- stratified_sample(train, cfg$tune_n, seed = cfg$seed + 1)
+cv_tune  <- make_cv_data(tune_raw, k = 3, seed = cfg$seed + 1)
+
+search <- cached("search",
+  random_search_gbm(cv_tune, sample_gbm_params(cfg$n_search, seed = cfg$seed),
+                    tree_grid = seq(100, 400, by = 100), imbalance = best_strategy, cores = 2))
+
+knitr::kable(head(search[, c("iteration", "cv_auc", "n.trees", "shrinkage", "interaction.depth",
+                             "n.minobsinnode", "bag.fraction")], 5),
+             digits = c(0, 4, 0, 3, 0, 0, 2), row.names = FALSE,
+             caption = "Five best configurations from the random search (3-fold CV AUC on the tuning sample)")
+best <- search[1, ]
+```
+
+```{r tuning-plot, fig.height = 3.8, fig.width = 7}
+ggplot(search, aes(x = reorder(factor(iteration), -cv_auc), y = cv_auc)) +
+  geom_col(fill = "#1F4E79") +
+  coord_cartesian(ylim = c(min(search$cv_auc) - 0.01, max(search$cv_auc) + 0.005)) +
+  labs(title = "Random search: CV AUC of each sampled configuration",
+       subtitle = paste0("Tuning sample of ", format(cfg$tune_n, big.mark = ","), " rows, 3-fold CV"),
+       x = "Search iteration (sorted by AUC)", y = "CV AUC") +
+  theme_minimal()
+```
+
+A model tuned on a small sample can pick settings that do not carry over to more data, so the winning configuration is re-checked on the larger comparison folds from Section 3 (`r format(cfg$compare_n, big.mark = ",")` rows) against the default gradient-boosting settings under the same imbalance strategy.
+
+```{r tuned-check}
+tuned_fn <- model_gbm(n.trees = best$n.trees, interaction.depth = best$interaction.depth,
+                      shrinkage = best$shrinkage, n.minobsinnode = best$n.minobsinnode,
+                      bag.fraction = best$bag.fraction)
+
+tuned_cv <- cached("tuned_check", cv_evaluate(cv_comp, tuned_fn, features = "engineered",
+                                              imbalance = best_strategy, cores = 2))
+
+default_row <- gbm_imb[gbm_imb$strategy == best_strategy, ]
+check_tbl <- rbind(
+  data.frame(model = paste0("Gradient boosting, default settings (", best_strategy, ")"),
+             cv_auc = default_row$cv_auc, auc_sd = default_row$auc_sd),
+  data.frame(model = paste0("Gradient boosting, tuned settings (", best_strategy, ")"),
+             cv_auc = mean(tuned_cv$auc), auc_sd = sd(tuned_cv$auc)))
+knitr::kable(check_tbl, digits = 4, col.names = c("Model", "CV AUC", "SD across folds"))
+
+# Both models use the same three folds, so the fold differences are paired
+default_folds <- cand$folds[cand$folds$model == "Gradient boosting, engineered features", ]$auc
+paired_diff   <- tuned_cv$auc - default_folds
+```
+
+## Re-selecting the number of trees at a larger sample size
+
+The check above is a warning sign: the settings that won on 10,000 rows do not beat the untuned defaults on the larger folds. The likely reason is the number of trees. With a low learning rate (`shrinkage`), a model needs enough trees to finish learning, and the right number grows with the amount of training data. A search on 10,000 rows can therefore favour a count that is too small for 27,000 or 307,000 rows. The fix is to keep the tuned *structure* (learning rate, tree size, leaf size, row sampling) and re-select only the number of trees on the larger comparison folds. The same curve is drawn for the default structure so the two can be compared fairly.
+
+```{r tree-curves}
+default_params <- data.frame(shrinkage = 0.05, interaction.depth = 4, n.minobsinnode = 50, bag.fraction = 0.7)
+tuned_label   <- sprintf("Tuned structure (depth %d, shrinkage %.3f, leaf %d, bag %.2f)",
+                         best$interaction.depth, best$shrinkage, best$n.minobsinnode, best$bag.fraction)
+default_label <- "Default structure (depth 4, shrinkage 0.050, leaf 50, bag 0.70)"
+
+curves <- cached("tree_curves", {
+  grid <- seq(100, 800, by = 100)
+  rbind(
+    cbind(config = default_label, gbm_tree_curve(cv_comp, default_params, grid, imbalance = best_strategy, seed = 1, cores = 2)),
+    cbind(config = tuned_label,   gbm_tree_curve(cv_comp, best,           grid, imbalance = best_strategy, seed = 1, cores = 2))
+  )
+})
+```
+
+```{r tree-curves-plot, fig.height = 4, fig.width = 8}
+ggplot(curves, aes(x = n.trees, y = cv_auc, colour = config)) +
+  geom_line(linewidth = 0.9) + geom_point() +
+  scale_colour_manual(values = c("#1F4E79", "#C0504D")) +
+  labs(title = "Cross-validated AUC by number of trees",
+       subtitle = paste0(format(cfg$compare_n, big.mark = ","), "-row comparison folds, 3-fold CV"),
+       x = "Number of trees", y = "CV AUC", colour = NULL) +
+  theme_minimal() + theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+```{r final-config}
+top <- curves[which.max(curves$cv_auc), ]
+final_params <- if (top$config == default_label) default_params else best
+final_trees  <- top$n.trees
+final_fn <- model_gbm(n.trees = final_trees, interaction.depth = final_params$interaction.depth,
+                      shrinkage = final_params$shrinkage, n.minobsinnode = final_params$n.minobsinnode,
+                      bag.fraction = final_params$bag.fraction)
+
+knitr::kable(data.frame(
+  Setting = c("Structure", "Number of trees", "CV AUC (comparison folds)", "SD across folds"),
+  Value   = c(top$config, final_trees, sprintf("%.4f", top$cv_auc), sprintf("%.4f", top$auc_sd))))
+```
+
+At 200 trees the tuned structure scored 0.7381, below the default model's 0.7415. With the tree count re-selected, the tuned structure (depth 3, shrinkage 0.030, leaf size 200, bag fraction 0.72) peaks at 600 trees with a CV AUC of 0.7425, compared to 0.7415 for the default structure at 300 trees. The tuned curve is also flatter: it stays within 0.0003 of its peak from 400 to 800 trees, while the default structure falls off after 300 trees as it begins to overfit. So the benefit of tuning is a gain of about 0.001 AUC and a model that is less sensitive to the tree count. That gain is far inside the noise, and the honest reading is that the default settings were already close to what this data allows. The tuned configuration at 600 trees is used as the final model because it has the highest mean AUC and the most stable curve.
+
+# 6. Supplementary tables
+
+The assignment makes this step optional. The data-preparation script from the previous assignment aggregates only the two application tables, and the supplementary tables (`bureau.csv`, `previous_application.csv`, `installments_payments.csv`, and the others) were not available in this environment, so **no supplementary features are used and no with/without comparison is reported**. Everything in this notebook is therefore a model built from application data alone. The natural next step would be to aggregate each supplementary table to one row per applicant, left-join it onto the application table, and rerun Sections 3 and 5 with and without the new columns.
+
+# 7. Final model and Kaggle submission
+
+The final model uses the gradient-boosting configuration selected at the end of Section 5 and the class-imbalance strategy chosen in Section 4. It is trained on **all** `r if (SMOKE) "(smoke-test subset of)" else ""` training rows. Preparation statistics are fit on the training data once and then applied, unchanged, to the test data; `fit_final_and_predict()` stops with an error if the prepared train and test designs differ in any column or category level.
+
+```{r final}
+final_train <- if (is.na(cfg$final_n)) train else stratified_sample(train, cfg$final_n, seed = cfg$seed)
+
+final <- cached("final", fit_final_and_predict(final_train, test, final_fn, features = "engineered",
+                                                imbalance = best_strategy, seed = cfg$seed))
+
+sub <- data.table(SK_ID_CURR = test$SK_ID_CURR, TARGET = final$test_pred)
+stopifnot(nrow(sub) == nrow(test), !anyNA(sub$TARGET), all(sub$TARGET >= 0 & sub$TARGET <= 1),
+          identical(sub$SK_ID_CURR, test$SK_ID_CURR))
+
+dir.create(file.path(root, "submissions"), showWarnings = FALSE)
+sub_file <- file.path(root, "submissions", if (SMOKE) "submission_smoke.csv" else "submission.csv")
+fwrite(sub, sub_file)
+```
+
+The submission file has `r format(nrow(sub), big.mark = ",")` rows (one per test applicant) and two columns, `SK_ID_CURR` and `TARGET` (the predicted probability of default), which is the format Kaggle requires. The model was trained on `r format(final$n_train, big.mark = ",")` rows and `r final$n_features` predictors.
+
+```{r final-plots, fig.height = 4, fig.width = 8}
+imp <- head(final$importance[order(-final$importance$influence), ], 15)
+imp$feature <- factor(imp$feature, levels = rev(imp$feature))
+ggplot(imp, aes(x = influence, y = feature)) +
+  geom_col(fill = "#1F4E79") +
+  labs(title = "What the final model relies on: 15 most influential predictors",
+       subtitle = "Relative influence (the 100% total is shared across all predictors)",
+       x = "Relative influence (%)", y = NULL) +
+  theme_minimal()
+```
+
+## Kaggle score
+
+```{r kaggle-score}
+# Score from uploading submissions/submission.csv to Kaggle:
+KAGGLE_SCORE <- 0.74224       # public leaderboard score (AUC)
+cv_estimate  <- top$cv_auc
+```
+
+- **Cross-validated AUC estimate for this configuration:** `r sprintf("%.4f", cv_estimate)` (3-fold, on `r format(cfg$compare_n, big.mark = ",")` rows). The final model is trained on all `r format(final$n_train, big.mark = ",")` rows, so the leaderboard score can differ from this estimate.
+- **Kaggle public score:** `r if (is.na(KAGGLE_SCORE)) "not yet recorded (submission.csv has been generated but not yet uploaded)" else sprintf("%.4f", KAGGLE_SCORE)`
+
+# 8. Sensitivity check: demographic fields
+
+The feature report flagged four fields as needing a fair-lending review before use in a credit decision: `CODE_GENDER`, `NAME_FAMILY_STATUS`, `CNT_CHILDREN` and `CNT_FAM_MEMBERS`. The models above include them, because they are ordinary application columns and Kaggle scores only predictive accuracy. Since the business problem statement lists fairness review as a constraint, it is worth knowing how much predictive accuracy depends on them. The final configuration is re-run on the same folds without those four columns.
+
+```{r demog-check}
+demog_cv <- cached("demog_check", cv_evaluate(cv_comp, final_fn, features = "engineered_no_demog",
+                                              imbalance = best_strategy, cores = 2))
+demog_tbl <- data.frame(
+  model  = c("Final configuration, all engineered features", "Final configuration, demographic fields removed"),
+  cv_auc = c(top$cv_auc, mean(demog_cv$auc)),
+  auc_sd = c(top$auc_sd, sd(demog_cv$auc)))
+knitr::kable(demog_tbl, digits = 4, col.names = c("Model", "CV AUC", "SD across folds"))
+```
+
+Removing the four fields lowers CV AUC from 0.7425 to 0.7412, a difference of 0.0013 that is well inside the fold-to-fold noise. This suggests that the model does not depend on these fields for its predictive power, which matters for a lender that has to defend the model on fair-lending grounds. The submitted model keeps them, because the assignment is scored on accuracy only, but a production version could drop them at almost no cost in AUC.
+
+# 9. Summary
+
+```{r summary-numbers, include = FALSE}
+ext_share <- sum(final$importance$influence[final$importance$feature %in% c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")])
+```
+
+**Models tried.** A majority-class benchmark (AUC 0.5, accuracy 91.93%), logistic regression on the three external scores, elastic-net logistic regression on raw and engineered features, two random forests, and gradient boosting on raw and engineered features. All were scored with 3-fold cross-validated AUC.
+
+**Result.** The best model is gradient boosting on the engineered features with a tuned structure and 600 trees. Its cross-validated AUC is `r sprintf("%.4f", top$cv_auc)` on `r format(cfg$compare_n, big.mark = ",")` rows, compared to 0.5 for the benchmark and 0.7151 for logistic regression on the external scores alone.
+
+**Why this model.** It has the highest mean AUC, and it is the most stable as the number of trees grows. The margin is small. The top three candidates, the three imbalance-handling results for gradient boosting, and the tuned and default settings are all within about one standard deviation of each other, so the choice among them is closer to a judgment call than to a clear win. Gradient boosting was preferred to the logistic regression because it can capture interactions without hand-built terms, and because its lead, though small, held across the raw features, engineered features and the tuning checks.
+
+**What did not help.** Class-imbalance adjustments did not raise AUC for gradient boosting. The random forests were weaker than boosting. Adding engineered features helped only slightly (0.7415 compared to 0.7410 for raw columns in boosting, and 0.7395 compared to 0.7321 in the elastic net).
+
+**What drives the predictions.** The three external scores account for `r sprintf("%.0f", ext_share)`% of the final model's relative influence. This suggests that the model is mostly a rule for combining those scores, with smaller contributions from credit-to-goods ratio and organization type.
+
+**Limits.** The comparison used 40,000 of the 307,511 training rows, and the final model was trained on all of them. The Kaggle public score of 0.7422 is close to the cross-validated estimate of `r sprintf("%.4f", top$cv_auc)`, so training on more rows did not raise the score by much and the cross-validation did not look optimistic. Supplementary tables were not used, and these usually carry substantial signal (bureau and repayment history), so adding them is the most likely route to a higher score.
