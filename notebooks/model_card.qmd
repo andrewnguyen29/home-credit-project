@@ -1,0 +1,574 @@
+---
+title: "Home Credit Default Risk: Model Card"
+subtitle: "Gradient boosting model for ranking loan applicants by risk of payment difficulties"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+    code-fold: false
+    number-sections: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(data.table)
+library(ggplot2)
+library(knitr)
+library(gbm)      # needed to score the saved gbm models
+
+# Find the repo root. The notebook can run from notebooks/ or from the repo root.
+root <- if (file.exists("src/data_preparation.R")) "." else ".."
+if (!file.exists(file.path(root, "src/data_preparation.R"))) {
+  stop("Could not find src/data_preparation.R. Open the repo folder as your working directory. Current folder: ", getwd())
+}
+
+# Slow steps are saved to models/cache (git-ignored), the same way as in modeling.qmd.
+cache_dir <- file.path(root, "models/cache")
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+cached <- function(name, expr) {
+  f <- file.path(cache_dir, paste0(name, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  res <- expr
+  saveRDS(res, f)
+  res
+}
+
+SKIP_PIPELINE <- TRUE
+source(file.path(root, "src/data_preparation.R"))
+train <- fread(file.path(root, "data/raw/application_train.csv"))
+
+# The modeling functions live in a collapsed code block in modeling.qmd. I load them
+# from there so that the model card uses exactly the same code as the modeling notebook.
+ln <- readLines(file.path(root, "notebooks/modeling.qmd"))
+s0 <- grep("^```\\{r modeling-functions", ln)
+e0 <- which(ln == "```" & seq_along(ln) > s0)[1]
+eval(parse(text = ln[(s0 + 1):(e0 - 1)]), envir = globalenv())
+
+# Final model settings, from Section 5 of modeling.qmd (random search, then tree count re-selected)
+GBM <- list(n.trees = 600, interaction.depth = 3, shrinkage = 0.03006824,
+            n.minobsinnode = 200, bag.fraction = 0.7167226)
+final_fn <- do.call(model_gbm, GBM)
+
+# Scores recorded in modeling.qmd
+CV_AUC <- 0.7425; CV_SD <- 0.0102     # 3-fold CV on 40,000 rows, 600 trees
+KAGGLE_AUC <- 0.74224                 # public leaderboard
+
+pct  <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+mil  <- function(x, d = 0) paste0(formatC(x / 1e6, format = "f", digits = d, big.mark = ","), "M")
+num  <- function(x) format(round(x), big.mark = ",")
+```
+
+```{r fit-models}
+# The modeling notebook saved only the test-set predictions, not the fitted model, so the
+# fitted models are rebuilt once here and saved (models/cache is git-ignored). Each fit uses
+# the same settings and the same code as modeling.qmd. The first run takes about 40 minutes with the SHAP step.
+fit_one <- function(tr_raw) {
+  st   <- fit_preprocessing(tr_raw)
+  trp  <- apply_preprocessing(tr_raw, st, is_train = TRUE)
+  spec <- fit_model_spec(trp, feature_set_columns(trp, "engineered"))
+  X    <- apply_model_spec(trp, spec)
+  pf   <- final_fn(X, tr_raw$TARGET, NULL)
+  list(m = environment(pf)$m, spec = spec, st = st, n_train = nrow(X), imp = attr(pf, "importance")())
+}
+
+# (a) Evaluation model: trained on 80% of the training rows, scored on the other 20%.
+H <- cached("mc_holdout", {
+  set.seed(2026)
+  i1 <- which(train$TARGET == 1); i0 <- which(train$TARGET == 0)
+  ho <- c(sample(i1, round(0.2 * length(i1))), sample(i0, round(0.2 * length(i0))))
+  h  <- fit_one(train[-ho]); h$ho_idx <- ho
+  Xho <- apply_model_spec(apply_preprocessing(train[ho], h$st, is_train = FALSE), h$spec)
+  h$p <- as.numeric(predict(h$m, Xho, n.trees = GBM$n.trees, type = "response"))
+  h
+})
+
+# (b) Final model: trained on all training rows (the model behind the Kaggle submission).
+FIN <- cached("mc_final", fit_one(train))
+```
+
+```{r shap-function}
+# Monte Carlo Shapley values on the probability scale (Strumbelj and Kononenko, 2014).
+# For each row and feature, the model scores two hybrid rows built from the applicant and a
+# random background applicant. The average difference over random feature orders estimates the
+# Shapley value. The values for one applicant add up to the applicant's predicted risk minus
+# the average predicted risk of the background applicants.
+shap_mc <- function(m, ntree, X, B, nsim = 40, seed = 1) {
+  set.seed(seed)
+  n <- nrow(X); pn <- ncol(X)
+  pred <- function(D) as.numeric(predict(m, D, n.trees = ntree, type = "response"))
+  phi <- matrix(0, n, pn, dimnames = list(NULL, names(X)))
+  for (s in seq_len(nsim)) {
+    b   <- B[sample.int(nrow(B), n, replace = TRUE), , drop = FALSE]
+    ord <- t(apply(matrix(runif(n * pn), n, pn), 1, order))
+    pos <- matrix(0L, n, pn)
+    for (i in seq_len(n)) pos[i, ord[i, ]] <- seq_len(pn)
+    for (j in seq_len(pn)) {
+      before <- pos < pos[, j]
+      plus <- X; minus <- X
+      for (k in seq_len(pn)) {
+        if (k == j) { minus[[k]] <- b[[k]]; next }
+        take_b <- !before[, k]
+        if (any(take_b)) { v <- X[[k]]; v[take_b] <- b[[k]][take_b]; plus[[k]] <- v; minus[[k]] <- v }
+      }
+      phi[, j] <- phi[, j] + (pred(plus) - pred(minus))
+    }
+  }
+  phi / nsim
+}
+```
+
+```{r shap-run}
+SH <- cached("mc_shap", {
+  X_all <- apply_model_spec(apply_preprocessing(train, FIN$st, is_train = TRUE), FIN$spec)
+  set.seed(11)
+  idx <- sample(nrow(X_all), 1000)
+  Xs  <- X_all[idx, , drop = FALSE]
+  B   <- X_all[sample(nrow(X_all), 100), , drop = FALSE]
+  predf <- function(D) as.numeric(predict(FIN$m, D, n.trees = GBM$n.trees, type = "response"))
+  list(idx = idx, X = Xs, phi = shap_mc(FIN$m, GBM$n.trees, Xs, B, nsim = 80),
+       p = predf(Xs), base = mean(predf(B)))
+})
+```
+
+```{r analysis}
+# ---- Evaluation on the 20% holdout (applicants the evaluation model never saw) ----
+ho_raw <- train[H$ho_idx]
+y <- ho_raw$TARGET; p <- H$p; credit <- ho_raw$AMT_CREDIT
+n_ho <- length(y); scale100k <- 1e5 / n_ho
+auc_ho <- fast_auc(y, p)
+
+# ---- Cost assumptions (sources are cited in the Decision Threshold Analysis section) ----
+LGD <- 0.60                 # share of the exposure lost when a loan defaults (range 0.50 to 0.75)
+EAD <- 0.70                 # share of the original credit still owed at default (my assumption)
+L   <- LGD * EAD            # loss on a problem loan, as a share of the credit amount
+NIM <- 0.157                # Home Credit net interest margin per year (FY2018 IFRS report)
+term_months <- median(train$AMT_CREDIT / train$AMT_ANNUITY, na.rm = TRUE)
+avg_bal <- 0.55             # average balance outstanding, as a share of the credit, for an amortizing loan
+M_derived <- NIM * avg_bal * term_months / 12
+M <- 0.14                   # margin on a repaid loan, as a share of the credit amount (rounded)
+p_star <- M / (L + M)       # break-even risk: approve when expected margin is above expected loss
+
+net_at <- function(t, L, M) {
+  f <- p >= t
+  (sum(credit[f & y == 1]) * L - sum(credit[f & y == 0]) * M) * scale100k
+}
+thr_grid <- seq(0.05, 0.60, by = 0.005)
+net_grid <- sapply(thr_grid, net_at, L = L, M = M)
+t_star <- thr_grid[which.max(net_grid)]
+flag <- p >= t_star
+
+confusion <- data.table(
+  tp = sum(flag & y == 1), fp = sum(flag & y == 0), fn = sum(!flag & y == 1), tn = sum(!flag & y == 0))
+precision <- confusion$tp / (confusion$tp + confusion$fp)
+recall    <- confusion$tp / (confusion$tp + confusion$fn)
+net_star  <- net_at(t_star, L, M)
+
+set.seed(7)
+boot <- replicate(500, {
+  i <- sample(n_ho, n_ho, replace = TRUE)
+  f <- p[i] >= t_star; yy <- y[i]; cr <- credit[i]
+  (sum(cr[f & yy == 1]) * L - sum(cr[f & yy == 0]) * M) * scale100k
+})
+net_ci <- quantile(boot, c(0.025, 0.975))
+
+thr_tbl <- rbindlist(lapply(c(0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50), function(t) {
+  f <- p >= t
+  data.table(threshold = t, declined = mean(f), caught = sum(y[f]) / sum(y),
+             precision = if (any(f)) mean(y[f]) else NA_real_,
+             good_declined = sum(f & y == 0) * scale100k,
+             net = net_at(t, L, M),
+             approved_rate = mean(y[!f]))
+}))
+
+# Sensitivity of the best threshold to the cost assumptions
+sens <- rbindlist(lapply(c(0.50, 0.60, 0.75), function(lg) rbindlist(lapply(c(0.08, 0.14, 0.20), function(mm) {
+  Lx <- lg * EAD
+  ng <- sapply(thr_grid, net_at, L = Lx, M = mm)
+  data.table(LGD = lg, margin = mm, best_t = thr_grid[which.max(ng)], best_net = max(ng),
+             net_at_base_t = net_at(t_star, Lx, mm))
+}))))
+
+# ---- Explainability ----
+phi <- SH$phi; Xs <- SH$X
+add_err <- mean(abs(rowSums(phi) - (SH$p - SH$base)))
+shap_imp <- data.table(feature = colnames(phi), mean_abs = colMeans(abs(phi)))[order(-mean_abs)]
+top_n <- 15
+top_feats <- shap_imp$feature[1:top_n]
+
+# ---- Fairness at the chosen threshold (holdout) ----
+fair_tbl <- function(v, drop = NULL) {
+  d <- data.table(g = ho_raw[[v]], y = y, appr = !flag)
+  if (!is.null(drop)) d <- d[!g %in% drop]
+  out <- d[, .(applicants = .N, approval_rate = mean(appr), default_rate = mean(y),
+               default_rate_approved = mean(y[appr]), precision_of_flags = if (any(!appr)) mean(y[!appr]) else NA_real_), by = g]
+  out[, impact_ratio := approval_rate / max(approval_rate)]
+  out[order(-approval_rate)]
+}
+fair_gender <- fair_tbl("CODE_GENDER", drop = "XNA")
+fair_edu    <- fair_tbl("NAME_EDUCATION_TYPE")
+```
+
+```{r adverse-dictionary}
+# Plain-language denial reasons for the top predictive inputs. Several inputs share one reason.
+reason_map <- list(
+  EXT_SOURCE_1       = "Limited or unfavorable credit history with external credit agencies",
+  EXT_SOURCE_2       = "Limited or unfavorable credit history with external credit agencies",
+  EXT_SOURCE_3       = "Limited or unfavorable credit history with external credit agencies",
+  CREDIT_GOODS_RATIO = "Loan amount is high compared to the price of the goods being financed",
+  AMT_ANNUITY        = "Regular payment amount is high for this loan",
+  AMT_GOODS_PRICE    = "Size of the purchase being financed",
+  AGE_X_EMPLOYED     = "Short or limited employment history",
+  ORGANIZATION_TYPE  = "Type of employer",
+  OCCUPATION_TYPE    = "Occupation type, or occupation not provided",
+  DAYS_ID_PUBLISH    = "Identity document was issued or changed recently",
+  FLAG_OWN_CAR       = "Limited assets reported on the application"
+)
+# Inputs that I would not give to an applicant as a reason, and why.
+no_reason <- list(
+  CODE_GENDER         = "Never a reason. Gender may not be used in a credit decision, so this input should be removed from the model.",
+  NAME_EDUCATION_TYPE = "Not given as a reason. Education can act as a stand-in for protected groups, so it needs a legal review.",
+  AGE_YEARS           = "Not given as a reason on its own. Age can only be used in limited ways, so it needs a legal review.",
+  FLAG_DOCUMENT_3     = "Not given as a reason. It has no clear business meaning, so Home Credit should explain it first."
+)
+```
+
+# Executive summary
+
+**Recommendation.** Use the model to rank loan applicants by risk, and send applicants whose predicted risk is above **`r pct(t_star)`** to a manual underwriting review before approval. Do not use it as an automatic denial rule. Keep the model on a monitoring schedule, and replace my cost assumptions with Home Credit's own figures before deployment.
+
+**How well it works.** The model ranks applicants well but not perfectly. Its AUC is `r sprintf("%.3f", KAGGLE_AUC)` on Kaggle's test data and `r sprintf("%.3f", CV_AUC)` in cross-validation (0.5 is a coin flip). On `r num(n_ho)` applicants held out from training, the flagged group had a payment-difficulty rate of `r pct(precision)`, compared to `r pct(mean(y))` for all applicants. The flag catches `r pct(recall)` of all problem loans while flagging only `r pct(mean(flag))` of applicants.
+
+**Expected financial impact.** At the `r pct(t_star)` threshold, the model is worth about **`r mil(net_star)` per 100,000 applications**, compared to approving everyone (95% range `r mil(net_ci[1])` to `r mil(net_ci[2])`). This uses a loss of `r pct(L, 0)` of the credit amount on a problem loan and a margin of `r pct(M, 0)` of the credit amount on a repaid loan. Both are built from published sources plus a few assumptions of my own, listed below. Amounts are in the dataset's currency units. The cost of running the manual reviews is not included.
+
+**Key caveats.**
+
+- **The result depends on the loss and margin assumptions.** At this threshold the benefit is positive in `r sum(sens$net_at_base_t > 0)` of the `r nrow(sens)` cost scenarios I tested, and it ranges from `r mil(min(sens$net_at_base_t))` to `r mil(max(sens$net_at_base_t))`. The negative case is a low loss combined with a high margin, where a higher threshold is better.
+- **The label is "payment difficulty", not final loss.** Some flagged applicants may have recovered, so the true cost of a problem loan is uncertain.
+- **Three outside credit scores drive the model.** Together they account for most of its decisions. Home Credit needs to confirm where these scores come from and that they can be used.
+- **Approval rates differ by group.** At this threshold, men and applicants with lower education are flagged more often. These gaps follow differences in observed problem rates, but they need a fair-lending review before use. The model should not use gender as an input.
+- **The data covers approved applicants only**, so the model has not seen the people Home Credit turned away.
+
+# Model details
+
+```{r details-table}
+details <- data.frame(
+  Item = c("Model type", "Version", "Software", "Settings", "Predictors", "Training data",
+           "Target", "Preparation", "Class imbalance", "Random seeds"),
+  Detail = c(
+    "Gradient boosted decision trees (R package gbm, Bernoulli loss). Output is the predicted probability of payment difficulties.",
+    "1.0, October 2026",
+    paste0("R ", getRversion(), ", gbm ", as.character(packageVersion("gbm"))),
+    sprintf("%d trees, tree depth %d, learning rate %.3f, at least %d applicants per leaf, %.0f%% of rows sampled per tree",
+            GBM$n.trees, GBM$interaction.depth, GBM$shrinkage, GBM$n.minobsinnode, 100 * GBM$bag.fraction),
+    "PLACEHOLDER_INPUTS",
+    sprintf("%s loan applications from Home Credit (application_train.csv only), %s of them with payment difficulties", num(nrow(train)), pct(mean(train$TARGET), 2)),
+    "TARGET = 1 means the client had payment difficulties (a late payment on one of the first installments). It is not the same as a final write-off.",
+    "Cleaning and feature statistics are learned on training rows only (src/data_preparation.R), then applied unchanged to new applicants.",
+    "No adjustment. I compared class weights, down- and up-sampling and SMOTE in modeling.qmd, and none improved the model.",
+    "2026 for the holdout split and 1 for the model fit"))
+details$Detail[5] <- sprintf("%d inputs: the application fields plus 17 features I engineered (ratios such as credit to income, age in years, cleaned job length, a count of external scores on file, and missing-data flags)", length(FIN$m$var.names))
+kable(details, col.names = c("", ""), align = "ll")
+```
+
+I compared nine model and feature-set combinations in `modeling.qmd` (logistic regression, elastic net, random forest and gradient boosting). I chose gradient boosting on the engineered features because it had the highest cross-validated AUC. The gap to the elastic net is small (about 0.003), so the choice is a judgment call and not a clear win.
+
+Two fitted versions of the model are used in this document. The **final model** is trained on all `r num(FIN$n_train)` training applicants and is the one behind the Kaggle submission. It is the model I explain in the SHAP and denial-reason sections. The **evaluation model** uses the same settings but is trained on a random 80% of the training applicants. I use it to measure performance at a threshold, because the other 20% (`r num(n_ho)` applicants) are data it has never seen.
+
+# Intended use
+
+**Who uses it.** Credit risk analysts and underwriting managers at a consumer lender such as Home Credit.
+
+**What decisions it informs.**
+
+- Ranking new applicants by their risk of payment difficulties at the time of application.
+- Deciding which applications go to a manual underwriting review (predicted risk at or above the chosen threshold).
+- Estimating how many problem loans a review policy would catch, and what that is worth.
+
+**What it is not designed for.**
+
+- **Automatic denial.** A person should review every flagged application, and every denial needs an explanation (see the denial reasons below).
+- **Pricing or credit limits.** The model predicts the chance of payment difficulties. It does not set interest rates or loan sizes.
+- **Other populations or products.** It was trained on Home Credit applications that were approved and made into loans. Its results do not transfer to a different lender, country or product without revalidation.
+- **Individual decisions without the caveats.** An AUC of about 0.74 means the model ranks groups well. It is far from certain for any one person.
+- **Use of protected characteristics.** The model currently includes gender and family fields. I recommend removing them before deployment (see Fairness Analysis).
+
+# Performance metrics
+
+```{r metrics-table}
+perf <- data.frame(
+  Metric = c("AUC, 3-fold cross-validation (40,000 rows)",
+             "AUC, Kaggle public leaderboard (final model)",
+             "AUC, 20% holdout (evaluation model)",
+             sprintf("Precision at the %s threshold (holdout)", pct(t_star)),
+             sprintf("Recall at the %s threshold (holdout)", pct(t_star)),
+             "Problem-loan rate among approved applicants (holdout)",
+             "Problem-loan rate among all applicants (holdout)"),
+  Value = c(sprintf("%.4f (SD %.4f across folds)", CV_AUC, CV_SD),
+            sprintf("%.5f", KAGGLE_AUC),
+            sprintf("%.4f", auc_ho),
+            pct(precision), pct(recall),
+            pct(mean(y[!flag])), pct(mean(y))))
+kable(perf, col.names = c("Metric", "Value"), align = "lr")
+```
+
+The three AUC values agree within about 0.01, which suggests the cross-validation was not overly optimistic. The holdout AUC is a little higher than the other two. This is because the holdout is a random slice of the training population, and Kaggle's test set is a separate group of applicants.
+
+**Precision** is the share of flagged applicants who had payment difficulties. **Recall** is the share of all problem loans that the flag catches. The table below shows the counts at the chosen threshold.
+
+```{r confusion-table}
+cm <- data.frame(
+  ` ` = c("Flagged (risk at or above the threshold)", "Approved (risk below the threshold)"),
+  `Had payment difficulties` = c(num(confusion$tp), num(confusion$fn)),
+  `Repaid without difficulties` = c(num(confusion$fp), num(confusion$tn)),
+  check.names = FALSE)
+kable(cm, align = "lrr", caption = sprintf("Holdout results at the %s threshold (%s applicants)", pct(t_star), num(n_ho)))
+```
+
+Most flagged applicants (`r pct(1 - precision)`) would have repaid. This is expected when only about 8% of applicants default, and it is the reason I recommend a manual review and not an automatic denial.
+
+# Decision threshold analysis
+
+## Cost assumptions
+
+The threshold depends on two numbers: how much Home Credit gains when a loan is repaid, and how much it loses when a loan has problems. Home Credit's own data does not include either, so I used published figures. Both are rough, and I show how the answer changes if they are wrong.
+
+```{r assumptions-table}
+as_tbl <- data.frame(
+  Assumption = c("Loss given default (LGD)", "Share of credit still owed at default", "Loss on a problem loan",
+                 "Net interest margin", "Typical loan length", "Margin on a repaid loan"),
+  `Value used` = c(pct(LGD, 0), pct(EAD, 0), sprintf("%s of the credit amount (%s x %s)", pct(L, 0), pct(LGD, 0), pct(EAD, 0)),
+                   pct(NIM, 1), sprintf("%.0f months", term_months),
+                   sprintf("%s of the credit amount (derived %s)", pct(M, 0), pct(M_derived, 1))),
+  `Basis` = c(
+    "Recovery on defaulted unsecured consumer debt is about 25% to 51% in a European bank collections study (so LGD of 49% to 75%), and 47% to 48% in a study of 6.5 million Italian consumer debts (LGD of about 52% to 53%). I used 60%.",
+    "My assumption. An amortizing loan is partly repaid before it defaults.",
+    "LGD times the share still owed.",
+    "Home Credit Group B.V., IFRS report for the 15 months to 31 December 2018.",
+    "Median of credit amount divided by annuity in the training data.",
+    "Net interest margin x average balance outstanding (about 55% of the credit for an amortizing loan) x loan length in years. This is a margin before servicing costs."),
+  check.names = FALSE)
+kable(as_tbl, align = "lll")
+```
+
+**Cross-check.** Home Credit reported a cost of risk of 10.7% for the same period. A loss of `r pct(L, 0)` of the credit on the `r pct(mean(train$TARGET), 1)` of loans with problems works out to about `r pct(mean(train$TARGET) * L / (term_months / 12), 1)` of credit per year, which is much smaller. The two figures are not directly comparable, because the report does not define the denominator and Home Credit's book includes other markets and products. Still, my loss assumption is not aggressive.
+
+**Sources.**
+
+- Home Credit Group B.V., [IFRS consolidated financial statements for the 15 months ended 31 December 2018](https://www.homecredit.net/wp-content/uploads/2022/12/HC-Group-BV-IFRS-2018-Q4-15M-without-auditor-signature.pdf): net interest margin of 15.7% and cost of risk of 10.7%.
+- De Almeida Filho, Mues and Thomas, [Optimizing the collections process in consumer credit](https://eprints.soton.ac.uk/71322/1/CORMSIS-09-07.pdf) (University of Southampton, working paper): total recovery of 25% to 51% of defaulted debt in a European bank's collections data.
+- Distaso, Roccazzella and Vrins (2023), [Business cycle and realized losses in the consumer credit industry](https://crc.business-school.ed.ac.uk/sites/crc/files/2024-01/Business-Cycle-and-Realized-Losses-in-the-Consumer-Credit-Industry.pdf): average recovery of 47% to 48% on consumer debts in banking and financing, and 34% across all sectors, using 6.5 million Italian non-performing consumer credits.
+- Thomas, Mues and Matuszyk, [Modelling LGD for unsecured personal loans: decision tree approach](https://eprints.soton.ac.uk/152549/1/jors_revision060309.doc) (University of Southampton): in nearly 50,000 defaulted UK personal loans, 30% of debtors paid in full and fewer than 10% paid nothing.
+
+## The best threshold
+
+An applicant should be approved when the expected margin is larger than the expected loss. With a margin of `r pct(M, 0)` and a loss of `r pct(L, 0)`, the break-even predicted risk is margin / (margin + loss) = **`r pct(p_star)`**. I then checked this against the holdout results by trying every threshold from 5% to 60%. The highest net benefit is at **`r pct(t_star)`**, which is close to the break-even value.
+
+```{r threshold-plot, fig.height = 4.2, fig.width = 8}
+ggplot(data.frame(t = thr_grid, net = net_grid / 1e6), aes(t, net)) +
+  geom_line(color = "#1F4E79", linewidth = 1) +
+  geom_vline(xintercept = t_star, linetype = "dashed", color = "#C2410C") +
+  annotate("text", x = t_star + 0.01, y = max(net_grid / 1e6) * 1.45, hjust = 0, color = "#C2410C",
+           label = sprintf("Chosen threshold: %s\nNet benefit: %s", pct(t_star), mil(net_star))) +
+  coord_cartesian(xlim = c(0.10, 0.60), ylim = c(-400, max(net_grid / 1e6) * 1.7)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Net benefit by threshold, per 100,000 applications",
+       subtitle = "Compared to approving everyone. Flagged = predicted risk at or above the threshold.",
+       x = "Threshold (predicted risk of payment difficulties)", y = "Net benefit (millions)") +
+  theme_minimal()
+```
+
+The net benefit is fairly flat near the top. A threshold anywhere from about 20% to 30% stays within about `r mil(max(net_grid) - min(net_grid[thr_grid %in% c(0.20, 0.30)]))` of the best. At this threshold the model is worth **`r mil(net_star)` per 100,000 applications** (95% range `r mil(net_ci[1])` to `r mil(net_ci[2])`, from resampling the holdout).
+
+## Sensitivity to the threshold
+
+```{r threshold-table}
+tt <- thr_tbl[, .(Threshold = pct(threshold, 0), `Applicants flagged` = pct(declined),
+                  `Problem loans caught (recall)` = pct(caught), `Precision` = pct(precision),
+                  `Good applicants flagged, per 100,000` = num(good_declined),
+                  `Problem rate among approved` = pct(approved_rate),
+                  `Net benefit per 100,000` = mil(net))]
+kable(tt, align = "rrrrrrr", caption = "Business outcomes at different thresholds (holdout, scaled to 100,000 applications)")
+```
+
+A lower threshold catches more problem loans but flags many more good applicants, and the net benefit falls. A higher threshold flags only the most extreme cases and leaves value on the table.
+
+## Sensitivity to the cost assumptions
+
+```{r sens-table}
+st <- sens[, .(`Loss given default` = pct(LGD, 0), `Margin on a repaid loan` = pct(margin, 0),
+               `Best threshold` = pct(best_t), `Net benefit at the best threshold` = mil(best_net),
+               `Net benefit at the chosen threshold` = mil(net_at_base_t))]
+kable(st, align = "rrrrr", caption = "Best threshold and net benefit under different cost assumptions (per 100,000 applications)")
+```
+
+A higher loss given default or a lower margin pushes the best threshold down, because avoiding a problem loan is worth more. A higher margin pushes it up, because turning away a good customer costs more. The chosen threshold is beneficial in `r sum(sens$net_at_base_t > 0)` of the `r nrow(sens)` cases. It loses money in the case with the lowest loss and the highest margin, where the best threshold is higher. The amounts change a lot across cases, so Home Credit should replace these assumptions with its own numbers and set the threshold again.
+
+# Explainability
+
+I explain the final model with **SHAP values**. A SHAP value splits one applicant's predicted risk into contributions from each input. For example, a value of +0.06 for an input means that input raised this applicant's predicted risk by 6 percentage points compared to an average applicant. I used a random sample of **1,000** training applicants, as the assignment suggests, and 100 random applicants as the average reference.
+
+I estimated the SHAP values by sampling, because the usual SHAP packages could not be installed for this version of R. For each applicant, the contributions add up to the predicted risk minus the average risk, within an average error of `r sprintf("%.4f", add_err)` (`r sprintf("%.2f", 100 * add_err)` percentage points).
+
+```{r shap-bar, fig.height = 5, fig.width = 8}
+d <- shap_imp[1:top_n]
+d[, feature := factor(feature, levels = rev(feature))]
+ggplot(d, aes(mean_abs * 100, feature)) +
+  geom_col(fill = "#1F4E79") +
+  labs(title = "Top 15 inputs by average SHAP value",
+       subtitle = "Average size of the change in predicted risk, in percentage points",
+       x = "Average absolute SHAP value (percentage points)", y = NULL) +
+  theme_minimal()
+```
+
+```{r shap-beeswarm, fig.height = 6.5, fig.width = 8.5}
+long <- rbindlist(lapply(top_feats, function(f) {
+  v <- Xs[[f]]
+  r <- if (is.numeric(v)) { q <- rank(v, na.last = "keep") / sum(!is.na(v)); q } else rep(NA_real_, length(v))
+  data.table(feature = f, shap = phi[, f] * 100, value_rank = r)
+}))
+long[, feature := factor(feature, levels = rev(top_feats))]
+set.seed(3)
+ggplot(long, aes(shap, feature, color = value_rank)) +
+  geom_vline(xintercept = 0, color = "grey60") +
+  geom_jitter(height = 0.22, size = 0.9, alpha = 0.7) +
+  scale_color_gradient(low = "#1F4E79", high = "#C2410C", na.value = "grey70",
+                       name = "Input value", breaks = c(0.05, 0.95), labels = c("Low", "High")) +
+  labs(title = "How each input moves predicted risk (1,000 applicants)",
+       subtitle = "Each dot is one applicant. Right of zero means higher predicted risk. Grey dots are category inputs.",
+       x = "SHAP value (percentage points of predicted risk)", y = NULL) +
+  theme_minimal()
+```
+
+**Top predictive features.**
+
+```{r top-feature-text, results = "asis"}
+# direction: does a low or a high value raise predicted risk? (numeric inputs only)
+dir_tbl <- rbindlist(lapply(top_feats, function(f) {
+  v <- Xs[[f]]
+  dirn <- if (is.numeric(v)) {
+    cc <- suppressWarnings(cor(v, phi[, f], method = "spearman", use = "complete.obs"))
+    if (is.na(cc)) "mixed" else if (cc < -0.1) "low" else if (cc > 0.1) "high" else "mixed"
+  } else "category"
+  data.table(feature = f, direction = dirn, mean_abs = shap_imp[feature == f, mean_abs])
+}))
+cat(sprintf("The three outside credit scores (EXT_SOURCE_1, 2 and 3) are the strongest inputs. Together they account for %s of the final model's relative influence, and they sit at the top of the SHAP ranking as well. Low scores push predicted risk up. The remaining top inputs each add much less.",
+            pct(sum(FIN$imp$influence[FIN$imp$feature %in% c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")]) / 100, 0)))
+```
+
+# Adverse action mapping
+
+When an applicant is denied, the lender must give understandable reasons. The table translates each top input into a plain-language reason. A reason is shown to an applicant only when that input raised their predicted risk, so I use the applicant's own SHAP values to choose which reasons to show.
+
+```{r reason-table}
+rt <- copy(dir_tbl)[order(-mean_abs)]
+rt[, rank := .I]
+rt[, `Raises risk when` := fifelse(direction == "low", "the value is low", fifelse(direction == "high", "the value is high",
+                          fifelse(direction == "category", "the category is a higher-risk one", "the value is unusual")))]
+rt[, reason := vapply(feature, function(f) {
+  if (f %in% names(reason_map)) reason_map[[f]]
+  else if (f %in% names(no_reason)) paste0("Do not use. ", no_reason[[f]])
+  else "Not mapped yet" }, character(1))]
+kable(rt[, .(Rank = rank, Input = feature, `Raises risk when`, `Reason given to the applicant` = reason)], align = "rlll")
+```
+
+## Example: a flagged applicant
+
+```{r example-applicant}
+cand <- which(SH$p >= t_star)
+ex <- cand[which.min(abs(SH$p[cand] - median(SH$p[cand])))]
+ex_phi <- phi[ex, ]
+ex_sorted <- names(sort(ex_phi, decreasing = TRUE))
+ex_top <- ex_sorted[1:6]
+ok <- ex_sorted[ex_sorted %in% names(reason_map) & ex_phi[ex_sorted] > 0]
+ex_reasons <- head(unique(unlist(reason_map[ok])), 4)
+```
+
+One applicant from the sample has a predicted risk of **`r pct(SH$p[ex])`**, above the `r pct(t_star)` threshold, compared to an average of `r pct(SH$base)`. The inputs that raised this applicant's risk the most were:
+
+```{r example-table}
+et <- data.table(Input = ex_top, `Effect on predicted risk` = sprintf("%+.1f points", 100 * ex_phi[ex_top]))
+kable(et, align = "lr")
+```
+
+Reasons the applicant would receive (inputs that may not be used as reasons are skipped, and inputs with the same reason are combined):
+
+```{r example-reasons, results = "asis"}
+cat(paste0(seq_along(ex_reasons), ". ", ex_reasons, collapse = "\n"))
+```
+
+# Fairness analysis
+
+I compared approval rates at the `r pct(t_star)` threshold, using the holdout applicants. An applicant is "approved" here if the model does not flag them. The **impact ratio** is a group's approval rate divided by the highest group's rate. A ratio below 0.80 is the common warning level (the "four-fifths rule").
+
+```{r fair-gender}
+fg <- fair_gender[, .(Group = fifelse(g == "F", "Female", fifelse(g == "M", "Male", g)), Applicants = num(applicants),
+                      `Flag rate` = pct(1 - approval_rate), `Approval rate` = pct(approval_rate),
+                      `Problem rate, all` = pct(default_rate), `Problem rate, flagged` = pct(precision_of_flags),
+                      `Flag rate vs. lowest group` = sprintf("%.1fx", (1 - approval_rate) / min(1 - approval_rate)),
+                      `Impact ratio` = sprintf("%.2f", impact_ratio))]
+kable(fg, align = "lrrrrrrr", caption = "By CODE_GENDER (4 applicants coded XNA are left out)")
+```
+
+```{r fair-edu}
+fe <- fair_edu[, .(Group = g, Applicants = num(applicants),
+                   `Flag rate` = pct(1 - approval_rate), `Approval rate` = pct(approval_rate),
+                   `Problem rate, all` = pct(default_rate), `Problem rate, flagged` = pct(precision_of_flags),
+                   `Flag rate vs. lowest group` = sprintf("%.1fx", (1 - approval_rate) / min(1 - approval_rate)),
+                   `Impact ratio` = sprintf("%.2f", impact_ratio))]
+kable(fe, align = "lrrrrrrr", caption = "By NAME_EDUCATION_TYPE (the Academic degree group has only a few applicants, so its rates are unreliable)")
+```
+
+```{r fair-text, results = "asis"}
+g_lo <- fair_gender[which.min(approval_rate)]; g_hi <- fair_gender[which.max(approval_rate)]
+nm <- function(g) fifelse(g == "F", "women", fifelse(g == "M", "men", g))
+e_big <- fair_edu[applicants >= 200]
+e_lo <- e_big[which.min(approval_rate)]; e_hi <- e_big[which.max(approval_rate)]
+cat(sprintf("**Gender.** The model flags %s of men and %s of women, so men are flagged %.1f times as often. The approval rates (%s and %s) look close, with an impact ratio of %.2f, which passes the four-fifths rule. The flag rates differ because the observed problem rates differ: %s of %s had payment difficulties, compared to %s of %s. Among the flagged applicants the problem rates are close (%s and %s), so the flag is about equally accurate for both groups.\n\n",
+  pct(1 - g_lo$approval_rate), pct(1 - g_hi$approval_rate), (1 - g_lo$approval_rate) / (1 - g_hi$approval_rate),
+  pct(g_lo$approval_rate), pct(g_hi$approval_rate), g_lo$impact_ratio,
+  pct(g_lo$default_rate), nm(g_lo$g), pct(g_hi$default_rate), nm(g_hi$g), pct(g_lo$precision_of_flags), pct(g_hi$precision_of_flags)))
+cat(sprintf("**Education.** Among groups with at least 200 holdout applicants, the flag rate runs from %s (%s) to %s (%s), a ratio of %.1f. The ordering matches the observed problem rates, which are highest for the lower education groups. All impact ratios are at least %.2f.",
+  pct(1 - e_hi$approval_rate), e_hi$g, pct(1 - e_lo$approval_rate), e_lo$g, (1 - e_lo$approval_rate) / (1 - e_hi$approval_rate), min(fair_edu$impact_ratio)))
+```
+
+**Implications.**
+
+- A difference in approval rates is not proof of unfair treatment, and a model can be accurate and still cause an unequal outcome. Under U.S. fair lending law, a policy with a disparate impact has to show a legitimate business need and no less discriminatory alternative.
+- Gender is a direct input to the model. In the U.S., lenders may not use gender in a credit decision. I tested removing gender and three family fields in `modeling.qmd`, and cross-validated AUC fell by only 0.0013. I recommend removing them before deployment, and then repeating this analysis.
+- Approval rates look similar because only about 5% of applicants are flagged. The denial side shows the gap more clearly: the flag rate is about twice as high for men as for women, and higher for lower education groups.
+- Education is not a protected attribute, but it can act as a stand-in for protected groups. The model uses it directly (it ranks `r which(shap_imp$feature == "NAME_EDUCATION_TYPE")` of `r nrow(shap_imp)` inputs by SHAP value), and it also uses age (rank `r which(shap_imp$feature == "AGE_YEARS")`). I recommend a legal review of both before deployment.
+- These checks use observed outcomes. They cannot show whether the historical lending process treated groups equally, because the data only contains applicants who were approved.
+
+# Limitations and risks
+
+**What the label measures.** The target is a payment difficulty on an early installment. It is not the same as a final default or write-off. Some of these loans may have been repaid after a late payment, so the model may overstate the loss from the applicants it flags.
+
+**Selection bias.** The training data only contains applicants who were approved and took out a loan. The model has never seen the applicants who were turned away, so it can be wrong about people who look different from past customers.
+
+**Narrow data.** I used only the main application table. I did not use the past loan, credit bureau, installment payment or credit card tables, which very likely hold useful signals about repayment behavior. The model's AUC of about 0.74 leaves a lot of room for improvement.
+
+**Dependence on three external scores.** The three outside credit scores account for most of the model's decisions, and the dataset does not explain how they are built. If a score changes, becomes unavailable, or is not allowed for credit decisions, the model's accuracy will fall. About 64% of applicants are missing at least one of the three scores, and the model treats a missing score as a signal.
+
+**Where it might fail.**
+
+- When the applicant mix changes (a new region, product or marketing channel), or when the economy changes.
+- For groups the model has seen little of, such as applicants in their 60s, where the holdout AUC is lower than for other ages.
+- For applicants with the placeholder job-length code. About 18% of applicants have it, and they have a lower observed problem rate, which I cannot explain.
+
+**Assumptions I could not verify.** The loss and margin figures come from published studies and a 2018 financial report, not from Home Credit's own loan data. The country, currency and time period of the dataset are not stated, so the dollar results are approximate.
+
+**Explanations are approximate.** The SHAP values come from a sampling method on 1,000 applicants, and the plain-language reasons simplify what the model does. A lender should review the reasons before using them in a real denial notice.
+
+**Missing information.** No data on the cost of manual review, on how reviewers decide, or on how applicants respond to a denial. The threshold and net benefit should be updated after a pilot.
+
+**Monitoring.** I recommend checking AUC and the risk-group chart each month on loans that have matured, repeating the fairness tables, and re-fitting the model when AUC falls below about 0.70.
+
+# Reproducing this document
+
+This notebook is `notebooks/model_card.qmd`. It loads the cleaning functions from `src/data_preparation.R` and the modeling functions from `notebooks/modeling.qmd`. On the first run it fits the two models and the SHAP values (about 40 minutes in total) and saves them in `models/cache/`, which is git-ignored. Later runs reuse them.
