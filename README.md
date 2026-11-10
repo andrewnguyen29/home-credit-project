@@ -1,112 +1,117 @@
-# Home Credit Default Risk
+# Home Credit Default Risk: Predicting Who Will Struggle to Repay
 
-This project uses the Home Credit data to explore the applications, build features, train models, and create a Kaggle submission.
+**In one paragraph:** Home Credit lends to people with little or no credit history, so it has very little to go on when it decides who to approve. I built a gradient boosting model, in R, that ranks applicants by their risk of payment difficulties. The riskiest tenth of applicants has a problem rate of 27.0%, compared to 1.5% for the safest tenth. The model scores 0.742 AUC on Kaggle. Under cost assumptions taken from published sources, sending the riskiest ~5% of applicants to manual review is worth about **120M per 100,000 applications**. I documented the model for a business reader in a model card that covers the decision threshold, explanations for denials, fairness, and limits.
 
-## Directory layout
+![Risk by group](reports/figures/risk_deciles.png)
 
-- `data/raw/`: original source data; do not modify
-- `data/interim/`: cleaned data and intermediate features
-- `data/processed/`: model-ready datasets
-- `docs/`: business and data documentation
-- `notebooks/`: exploratory, modeling and model card notebooks
-- `src/`: reusable R code (`data_preparation.R`)
-- `models/`: saved model files
-- `reports/`: figures and evaluation metrics
-- `submissions/`: generated submission files
-- `tests/`: automated tests
+## At a glance
 
-## Data Preparation
-
-`src/data_preparation.R` turns the findings from my EDA notebook into reusable functions. It follows the "Data preparation decisions" table in that notebook. Each function has a comment that points back to the EDA finding behind it, so the code can be checked against the analysis.
-
-**What it does:**
-- Flags the impossible `DAYS_EMPLOYED` code (365243, about 18% of rows) and converts the valid values into years employed
-- Converts `DAYS_BIRTH` into age in years
-- Adds three ratios: credit to income, annuity to income, and credit to goods price
-- Adds a count of available `EXT_SOURCE` scores. The EDA showed that the count relates to `TARGET`
-- Adds missing-value flags for columns where the missing rate differed by `TARGET`
-- Adds two interaction terms (age by years employed, annuity-to-income by score count) and two binned features (age band and credit-to-income quintile)
-
-**How train and test stay consistent:**
-The script separates fitting from applying. `fit_preprocessing(train)` is the only function that computes anything from the data. It calculates the imputation medians and bin cut points from `application_train` only and returns them as one list. `apply_preprocessing(df, stats, is_train)` uses that list on either train or test. It never calculates a new statistic. This means both datasets get the same medians, the same bin cut points, and the same columns. This is how the script prevents data leakage.
-
-`validate_train_test_consistency()` checks the result. It confirms that the prepared train and test data have the same columns, except for `TARGET`, which only exists in train.
-
-**How to run it:** run the whole file from the repo root, with the two CSV files in `data/raw/`. It defines the functions and then runs the pipeline in the last section. It prints the row and column counts and the consistency check. It also saves the fitted statistics and the prepared data to folders that Git ignores. To load only the functions, as the modeling notebook does, set `SKIP_PIPELINE <- TRUE` before `source()`. The same steps one at a time:
-```r
-SKIP_PIPELINE <- TRUE
-source("src/data_preparation.R")
-
-train <- fread("data/raw/application_train.csv")
-test  <- fread("data/raw/application_test.csv")
-
-prep_stats  <- fit_preprocessing(train)
-train_ready <- apply_preprocessing(train, prep_stats, is_train = TRUE)
-test_ready  <- apply_preprocessing(test,  prep_stats, is_train = FALSE)
-
-check <- validate_train_test_consistency(train_ready, test_ready)
-stopifnot(check$identical)
-
-saveRDS(prep_stats, "models/preprocessing_stats.rds")
-```
-
-**Scope:** my EDA only covered `application_train` and `application_test`. I did not analyze the supplementary tables (bureau, previous applications, POS cash and credit card balances, installment payments), so the script covers the application data only. A commented-out example at the end shows where the supplementary tables would go. The pattern is to summarize each table to one row per `SK_ID_CURR` and then left-join it. I did not build it because the EDA did not make those decisions.
-
-**Fix made during modeling:** `fread()` reads blank text fields as `""` and not `NA`. This made `OCCUPATION_TYPE_MISSING` `FALSE` for every row, even though 96,391 applicants have a blank occupation. `add_missing_indicators()` now counts blank strings as missing. Use the updated `data_preparation.R`.
-
-## Modeling
-
-`notebooks/modeling.qmd` (compiled to `modeling.html`) builds, compares, and tunes the models and creates the Kaggle submission. The modeling functions are in a collapsed code block inside the notebook. The cleaning and feature functions come from `src/data_preparation.R`. In every cross-validation fold, the preparation statistics are re-fit on the training rows only. Any resampling also touches the training rows only.
-
-**Models tried** (3-fold cross-validation on a 40,000-row sample, scored by AUC):
-
-| Model | CV AUC |
+| | |
 |---|---|
-| Majority class (benchmark) | 0.5000 (accuracy 91.93%) |
+| **Data** | 307,511 loan applications from the Kaggle Home Credit Default Risk competition, 8.07% with payment difficulties |
+| **Model** | Gradient boosting (R `gbm`), 600 trees, 135 inputs including 17 features I built |
+| **Kaggle score** | **0.74224 AUC** (public leaderboard). Cross-validated: 0.7425. 20% holdout: 0.7535 |
+| **Chosen threshold** | Flag applicants with predicted risk of 24% or more (4.9% of applicants) |
+| **At that threshold** | Flagged group has a 33.7% problem rate (vs. 8.1% overall). The flag catches 20.4% of all problem loans |
+| **Business value** | About 120M per 100,000 applications (95% range 93M to 146M), in dataset currency units, before review costs |
+| **Biggest driver** | Three external credit scores make up 68% of the model's relative influence |
+
+## The business problem
+
+Home Credit makes installment loans to people that banks often turn away. Many of these applicants have no credit bureau record. This leads to two costly mistakes: approving loans that go bad, and declining people who would have repaid. Losses cut profit, and good applicants who are declined may end up with worse lenders.
+
+**Objective:** score every applicant at the time of application, so that underwriters can spend their review effort on the few who need it, without turning away good customers. I measured success with AUC, which shows how well a model ranks the people who struggle above the people who repay. The full problem statement is in [`docs/Home_Credit_Business_Problem_Statement.docx`](docs/Home_Credit_Business_Problem_Statement.docx).
+
+## My solution
+
+1. **Explored the data** ([EDA notebook](notebooks/01_eda.qmd)). I found that about 18% of applicants have an impossible job length (a placeholder code, about 1,000 years), that the external credit scores are often missing, and that missing scores relate to the outcome.
+2. **Prepared the data** ([`src/data_preparation.R`](src/data_preparation.R)). I turned each EDA finding into a reusable function: cleaned job length, age in years, credit-to-income and credit-to-price ratios, a count of available scores, and missing-data flags. All statistics are learned on training rows only, so nothing leaks from test data.
+3. **Compared and tuned models** ([modeling notebook](notebooks/modeling.qmd)). I tested logistic regression, elastic net, random forest, and gradient boosting, with leakage-safe 3-fold cross-validation. I tried four fixes for class imbalance and ran a randomized search for the final settings.
+4. **Turned the model into a decision** ([model card](notebooks/model_card.qmd)). I chose a threshold from published loan cost figures, explained the model with SHAP values, translated its drivers into plain-language denial reasons, and checked fairness by gender and education.
+
+| Model (3-fold CV on 40,000 rows) | AUC |
+|---|---|
+| Majority class benchmark | 0.5000 |
 | Logistic regression, 3 external scores | 0.7151 |
-| Elastic-net logistic, raw columns | 0.7321 |
-| Elastic-net logistic, engineered features | 0.7395 |
-| Random forest, depth 8 / depth 14 | 0.7245 / 0.7199 |
-| Gradient boosting, raw columns | 0.7410 |
-| Gradient boosting, engineered features (default settings) | 0.7415 |
-| Gradient boosting, tuned settings, 600 trees | **0.7425** |
+| Random forest | 0.7245 |
+| Elastic net, engineered features | 0.7395 |
+| Gradient boosting, default settings | 0.7415 |
+| **Gradient boosting, tuned (final)** | **0.7425** |
 
-**Class imbalance:** I compared class weights, downsampling, upsampling, and SMOTE (numeric columns only) to no adjustment. None improved gradient boosting. The best adjusted result was 0.7393, compared to 0.7415 with no adjustment. The elastic-net differences were within the noise between folds. I used no adjustment.
+The final choice is only 0.001 above the default settings and 0.003 above the elastic net. Fold-to-fold noise is about 0.01. This suggests that the choice is a judgment call and not a clear win.
 
-**Tuning:** I ran a random search of 20 settings on a 10,000-row sample with 3-fold cross-validation. It covered learning rate, tree depth, leaf size, row sampling, and number of trees. I then checked the best settings on the larger folds and re-selected the tree count there, which gave 600 trees. The final model was trained on all 307,511 training rows.
+## The business value
 
-**Why I chose this model:** gradient boosting on the engineered features with the tuned settings has the highest mean CV AUC. Its AUC also stays flat as trees are added, compared to the default settings, which get worse after 300 trees. The gap is small. It is 0.001 above the default settings and 0.003 above the elastic-net logistic regression, and the fold-to-fold standard deviation is about 0.01. This suggests that the choice is a judgment call and not a clear win. The three external scores make up about 68% of the final model's relative influence.
+- **It finds the risk.** On 61,502 applicants the model had never seen, the riskiest tenth had a 27.0% problem rate and the safest tenth had 1.5%. One third of all problem loans sit in the riskiest tenth.
+- **A small review policy pays off.** At the 24% threshold, the flagged group (4.9% of applicants) holds 20.4% of the problem loans. The problem rate among approved applicants falls from 8.1% to 6.8%.
+- **The money.** I used published recovery studies and Home Credit's own 2018 financial report for the loss on a problem loan (42% of credit) and the margin on a repaid loan (14% of credit). Compared to approving everyone, the policy is worth about **120M per 100,000 applications** (95% range 93M to 146M). The break-even risk is 25%, and the best threshold is 24%.
+- **The caveat.** The benefit is positive in 8 of the 9 cost scenarios I tested, but its size changes a lot with the assumptions. It turns negative when the loss is low and the margin is high. Home Credit should replace my assumptions with its own figures. The cost of running the reviews is not included.
 
-**Fairness check:** removing gender, family status, children, and family size lowers CV AUC by only 0.0013 (to 0.7412). This suggests that the model does not depend on those fields.
+![Net benefit by threshold](reports/figures/threshold_net_benefit.png)
 
-**Supplementary tables:** not used. They were not available in my environment.
+## Difficulties I ran into
 
-**Kaggle score:** the public leaderboard AUC is **0.74224**, compared to a cross-validated estimate of 0.7425. The two are close, which suggests that the cross-validation was not overly optimistic.
+- **Data leakage is easy to cause.** Medians, bin cut points, and category levels all come from data. I split fitting from applying, and I re-fit every statistic inside each cross-validation fold.
+- **A silent bug.** `fread()` reads blank text as `""` and not `NA`. My `OCCUPATION_TYPE` missing flag was `FALSE` for every row, even though 96,391 applicants have a blank occupation. I caught it during modeling, fixed the function, and reran everything.
+- **Tuning did not help at first.** My tuned settings did not beat the defaults at 200 trees. The best settings needed more trees than my search allowed. Re-selecting the tree count on larger folds gave the final 600 trees.
+- **Positron would not fork R.** My parallel code failed. I rewrote it with fresh R processes (a PSOCK cluster) and fixed a missing-constants error on the workers.
+- **The model was not saved.** My modeling notebook saved only the test predictions. For the model card I had to refit the model and keep the fitted objects. The SHAP packages also would not install for my version of R, so I wrote a sampling-based SHAP estimator and checked that its values add up to the predictions.
+- **The data has no costs.** Loss and margin are not in the dataset. I had to find real figures, and I had to be clear about which numbers are published and which are my assumptions.
+- **The label is not a final loss.** `TARGET` flags a late payment on an early installment, so a flagged loan may still have been repaid.
 
-**To reproduce:**
+## What I learned
+
+- **Ranking is not a decision.** An AUC of 0.74 says little about money until you choose a threshold and attach costs. The threshold decides whether the model gains 120M or loses hundreds of millions.
+- **Honest validation takes effort.** The Kaggle score (0.742) was close to my cross-validated estimate (0.7425), and I can trust that because I kept preparation inside the folds.
+- **Small gains need small claims.** The gap between my best models was inside the noise, so I reported the choice as a judgment call.
+- **A model card changes how you think.** Writing denial reasons, fairness tables, and limits made me look at inputs I would normally ignore. Gender is a model input, and the fairness tables showed men are flagged 2.2 times as often as women. I now recommend removing it.
+- **Presenting the results.** I turned this work into a 9-minute presentation for decision-makers. Leading with the business result and putting the process in an appendix made the same findings much easier to follow.
+
+## Interview talking points
+
+- **Why AUC?** About 92% of applicants repay, so accuracy is misleading (a model that approves everyone is 92% accurate). AUC measures ranking, which is what an underwriter needs.
+- **How did I avoid leakage?** Fit and apply are separate functions. Every fold re-fits medians, bin edges, and category levels on its own training rows. Resampling touches training rows only.
+- **Why gradient boosting?** It had the highest CV AUC, and its AUC stayed flat as I added trees. I would say plainly that the gap to the elastic net was small.
+- **How did I pick the threshold?** Approve when expected margin is above expected loss, so the break-even risk is margin / (margin + loss) = 25%. I checked it against every threshold on a holdout and picked 24%.
+- **What would I do about fairness?** Remove gender, repeat the fairness tables, and have lawyers review education and age. The flag is equally accurate for men and women (33% and 34% problem rate among flagged applicants), but the flag rates differ.
+- **What are the biggest risks?** Dependence on three outside scores, a label that is not a final loss, approved-applicants-only data, and cost assumptions that are not Home Credit's.
+- **What would I do next?** Add the supplementary tables (credit bureau, previous applications, installments, credit cards, POS cash), run a pilot to replace my cost assumptions, and monitor AUC and fairness monthly.
+
+## What is in this repository
+
+| Item | What it is |
+|---|---|
+| [`notebooks/01_eda.qmd`](notebooks/01_eda.qmd) ([PDF](notebooks/pdf/01_eda.pdf)) | Exploratory analysis and data preparation decisions |
+| [`src/data_preparation.R`](src/data_preparation.R) | Reusable cleaning and feature functions, with train and test checks |
+| [`notebooks/modeling.qmd`](notebooks/modeling.qmd) ([PDF](notebooks/pdf/modeling.pdf)) | Model comparison, class imbalance, tuning, final model, Kaggle score |
+| [`notebooks/model_card.qmd`](notebooks/model_card.qmd) ([PDF](notebooks/pdf/model_card.pdf)) | Model card: threshold, SHAP, denial reasons, fairness, limits, executive summary |
+| [`reports/figures/`](reports/figures) | Figures used in this README |
+| [`docs/`](docs) | Business problem statement |
+
+GitHub shows `.qmd` files as source code, so I added a PDF of each rendered notebook. Data, saved models, and submission files are not committed (see `.gitignore`).
+
+## Model card summary
+
+The model card is written for a business reader who is deciding whether to deploy the model.
+
+- **Intended use:** rank applicants and send high-risk ones to a human review. It is not meant for automatic denial, pricing, or other lenders and products.
+- **Explainability:** SHAP values on a 1,000-applicant sample. The three outside scores lead, followed by loan-to-price ratio, annuity, and employment history.
+- **Denial reasons:** each top input has a plain-language reason. Gender, education, and age are never given as reasons.
+- **Fairness:** flag rates and impact ratios by gender and education at the chosen threshold, with a recommendation to remove gender.
+- **Limitations:** the label is not a final loss, the data covers approved applicants only, the model uses only the main application table, and the cost figures are assumptions.
+
+![Top SHAP inputs](reports/figures/shap_top15.png)
+
+## Reproducing my work
+
+Put `application_train.csv` and `application_test.csv` in `data/raw/`, open the repo folder as the working directory, and run these from the repo root:
+
 ```r
-# from the repo root, with the data in data/raw/
-quarto render notebooks/modeling.qmd
+source("src/data_preparation.R")             # runs the preparation pipeline
+quarto render notebooks/modeling.qmd         # about 45 minutes on 2 cores, cached
+quarto render notebooks/model_card.qmd       # about 40 minutes the first time, then under a minute
 ```
-A full run takes about 45 minutes on 2 cores. The slow steps are saved under `models/cache/`, which Git ignores. Setting `MODELING_SMOKE=1` runs a tiny version for testing. Packages needed: `data.table`, `ggplot2`, `glmnet`, `ranger`, `gbm`, `themis`, `recipes`.
 
-## Model Card
+Packages: `data.table`, `ggplot2`, `glmnet`, `ranger`, `gbm`, `themis`, `recipes`, `knitr`, `scales`. Setting `MODELING_SMOKE=1` runs a tiny version of the modeling notebook for testing.
 
-`notebooks/model_card.qmd` (compiled to `model_card.html`) documents the final model for a business reader who is deciding whether to deploy it. The code is hidden in the HTML, so it reads like a document. It covers the sections the assignment asks for:
-
-- **Model details and intended use:** gradient boosting (600 trees, depth 3, 135 inputs) trained on 307,511 applications, who should use it, and what it should not be used for.
-- **Performance:** AUC is 0.7425 in cross-validation, 0.74224 on Kaggle, and 0.7535 on a 20% holdout. At the chosen threshold, precision is 33.7% and recall is 20.4% on the holdout.
-- **Decision threshold:** I used published figures for the loss on a problem loan (60% loss given default on 70% of the credit, so 42%) and the margin on a repaid loan (14%, from Home Credit's 15.7% net interest margin). The break-even predicted risk is 25%, and the best threshold on the holdout is **24.0%**. At that threshold the model is worth about **120M per 100,000 applications** compared to approving everyone (95% range 93M to 146M). A sensitivity table shows how the best threshold and the benefit change with the cost assumptions. The benefit is positive in 8 of the 9 scenarios I tested.
-- **Explainability:** SHAP values on a 1,000-row sample. The three external credit scores are the top inputs.
-- **Adverse action mapping:** plain-language denial reasons for the top inputs, and an example applicant. Gender, education and age are not given as reasons.
-- **Fairness:** approval and flag rates by gender and education at the chosen threshold. Men are flagged 2.2 times as often as women, and the gap follows their different problem rates. I recommend removing gender before deployment.
-- **Limitations and an executive summary.**
-
-**Note on the saved model:** `modeling.qmd` saved only the test predictions, not the fitted model. The model card fits the final model (all rows) and an evaluation model (80% of rows) once and saves them in `models/cache/`, which Git ignores. It uses the same settings and the same functions as `modeling.qmd`, which it loads from that file. I estimated SHAP values with a sampling method that I wrote, because the SHAP packages could not be installed for my version of R.
-
-**To reproduce:**
-```r
-# from the repo root, with the data in data/raw/ and after running modeling.qmd once
-quarto render notebooks/model_card.qmd
-```
-The first run takes about 40 minutes (two model fits and the SHAP step). Later runs take under a minute. Packages needed: `data.table`, `ggplot2`, `gbm`, `knitr`, `scales`.
+**Author:** Andrew Nguyen, MSBA, University of Utah
